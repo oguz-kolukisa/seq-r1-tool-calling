@@ -1,0 +1,985 @@
+"""
+GRPO Training Script for Sub-Question Generation
+
+This script trains the LLM's sub-question generation function using
+Group Relative Policy Optimization (GRPO) with a judge LLM for scoring.
+"""
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Dict, Tuple
+import json
+import os
+import hashlib
+from dataclasses import dataclass
+from tqdm import tqdm
+import numpy as np
+import config
+import logging
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration for GRPO training."""
+    
+    # Model paths
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct"  # Model to train
+    judge_model_name: str = "Qwen/Qwen2.5-7B-Instruct"  # Larger model for judging
+    
+    # Training hyperparameters
+    learning_rate: float = 1e-5
+    batch_size: int = 4
+    num_epochs: int = 3
+    group_size: int = 4  # Number of generations per question for GRPO
+    kl_coef: float = 0.1  # KL divergence coefficient
+    clip_range: float = 0.2  # PPO-style clipping range
+    
+    # Generation parameters
+    max_new_tokens: int = 256
+    temperature: float = 0.9
+    top_p: float = 0.95
+    
+    # Reward weights for different criteria (sum to 1.0)
+    reward_weights: Dict[str, float] = None
+    
+    # Paths
+    dataset_path: str = "data/vqav2/train_index.json"
+    checkpoint_dir: str = "checkpoints/subquestion_grpo"
+    log_dir: str = "logs/subquestion_grpo"
+    resume_from_checkpoint: str = None  # Path to checkpoint to resume from
+    
+    # Checkpoint parameters
+    checkpoint_every_n_steps: int = 100  # Save checkpoint every N steps
+    force_resume: bool = False  # If True, skip dataset mismatch prompt
+    
+    # Data parameters
+    min_question_length: int = 5  # Minimum words for complex questions
+    default_context: str = "car, person, building, street, vehicle, outdoor"  # Placeholder context
+    max_training_samples: int = 200  # Maximum samples to use for training
+    dataset_hash: str = None  # Hash of dataset for consistency checking
+    
+    def __post_init__(self):
+        if self.reward_weights is None:
+            self.reward_weights = {
+                "diversity": 0.20,      # How different questions are from each other
+                "relevance": 0.25,      # How relevant to original question
+                "answerability": 0.25,  # Can sub-Qs be answered independently?
+                "completeness": 0.20,   # Do sub-Qs cover the original question?
+                "clarity": 0.10,        # Are sub-Qs clear and well-formed?
+            }
+
+
+class JudgeLLM:
+    """Judge LLM for scoring sub-questions."""
+    
+    def __init__(self, model_name: str):
+        """Initialize judge model.
+        
+        Args:
+            model_name: HuggingFace model name for judge
+        """
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Initializing Judge LLM: {model_name}")
+        logger.debug(f"Device for Judge LLM: {self.device}")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        logger.debug("Judge tokenizer loaded successfully")
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
+        )
+        logger.info("Judge model loaded successfully")
+        
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            logger.debug("Set pad_token to eos_token")
+    
+    def score_diversity(self, sub_questions: List[str]) -> float:
+        """Score how diverse/different the sub-questions are from each other.
+        
+        Args:
+            sub_questions: List of generated sub-questions
+            
+        Returns:
+            Diversity score from 1-10
+        """
+        logger.debug(f"Scoring diversity for {len(sub_questions)} sub-questions")
+        
+        prompt = f"""Rate the diversity of these sub-questions on a scale of 1-10, where:
+- 1-3: Very similar or repetitive questions
+- 4-6: Some variation but overlapping concepts
+- 7-9: Diverse questions covering different aspects
+- 10: Highly diverse, each question explores a unique angle
+
+Sub-questions:
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(sub_questions))}
+
+Provide only a single number from 1 to 10 as your rating."""
+
+        response = self._generate(prompt, max_new_tokens=10)
+        score = self._extract_score(response)
+        logger.debug(f"Diversity score: {score} (response: {response[:50]}...)")
+        return score
+    
+    def score_relevance(self, original_question: str, sub_questions: List[str], 
+                       context: str) -> float:
+        """Score how relevant sub-questions are to the original question.
+        
+        Args:
+            original_question: The original complex question
+            sub_questions: List of generated sub-questions
+            context: Image context from CLIP
+            
+        Returns:
+            Relevance score from 1-10
+        """
+        prompt = f"""Rate the relevance of these sub-questions to the original question on a scale of 1-10, where:
+- 1-3: Sub-questions are off-topic or unrelated
+- 4-6: Partially relevant but miss key aspects
+- 7-9: Highly relevant, addressing the core question
+- 10: Perfect relevance, directly supporting the answer
+
+Image Context: {context}
+
+Original Question: {original_question}
+
+Sub-questions:
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(sub_questions))}
+
+Provide only a single number from 1 to 10 as your rating."""
+
+        response = self._generate(prompt, max_new_tokens=10)
+        return self._extract_score(response)
+    
+    def score_answerability(self, sub_questions: List[str], context: str,
+                           ground_truth: str = None) -> float:
+        """Score whether sub-questions can be answered independently with tools.
+        
+        Args:
+            sub_questions: List of generated sub-questions
+            context: Image context from CLIP
+            ground_truth: Optional ground truth answer as hint
+            
+        Returns:
+            Answerability score from 1-10
+        """
+        gt_hint = f"\nGround Truth Answer (for reference): {ground_truth}" if ground_truth else ""
+        
+        prompt = f"""Rate how well these sub-questions can be answered independently using vision tools (object detection, OCR) on a scale of 1-10, where:
+- 1-3: Questions require complex reasoning or external knowledge
+- 4-6: Questions are answerable but require multiple steps
+- 7-9: Questions can be directly answered with available tools
+- 10: All questions are atomic and perfectly answerable
+
+Image Context: {context}{gt_hint}
+
+Sub-questions:
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(sub_questions))}
+
+Available tools: object detection (grounding_dino), text recognition (OCR)
+
+Provide only a single number from 1 to 10 as your rating."""
+
+        response = self._generate(prompt, max_new_tokens=10)
+        return self._extract_score(response)
+    
+    def score_completeness(self, original_question: str, sub_questions: List[str],
+                          ground_truth: str = None) -> float:
+        """Score whether answering the sub-questions would answer the original.
+        
+        Args:
+            original_question: The original complex question
+            sub_questions: List of generated sub-questions
+            ground_truth: Optional ground truth answer for validation
+            
+        Returns:
+            Completeness score from 1-10
+        """
+        gt_hint = f"\nGround Truth Answer (for validation): {ground_truth}" if ground_truth else ""
+        
+        prompt = f"""Rate how completely these sub-questions cover what's needed to answer the original question on a scale of 1-10, where:
+- 1-3: Major gaps, missing critical information
+- 4-6: Partial coverage, some aspects missing
+- 7-9: Good coverage, most information present
+- 10: Complete coverage, answering all sub-questions gives full answer
+
+Original Question: {original_question}{gt_hint}
+
+Sub-questions:
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(sub_questions))}
+
+Provide only a single number from 1 to 10 as your rating."""
+
+        response = self._generate(prompt, max_new_tokens=10)
+        return self._extract_score(response)
+    
+    def score_clarity(self, sub_questions: List[str]) -> float:
+        """Score the clarity and well-formedness of sub-questions.
+        
+        Args:
+            sub_questions: List of generated sub-questions
+            
+        Returns:
+            Clarity score from 1-10
+        """
+        prompt = f"""Rate the clarity and well-formedness of these sub-questions on a scale of 1-10, where:
+- 1-3: Unclear, grammatically incorrect, or confusing
+- 4-6: Understandable but awkwardly phrased
+- 7-9: Clear and well-formed questions
+- 10: Perfectly clear, concise, and well-structured
+
+Sub-questions:
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(sub_questions))}
+
+Provide only a single number from 1 to 10 as your rating."""
+
+        response = self._generate(prompt, max_new_tokens=10)
+        return self._extract_score(response)
+    
+    def compute_reward(self, original_question: str, sub_questions: List[str],
+                      context: str, ground_truth: str = None,
+                      weights: Dict[str, float] = None) -> Dict[str, float]:
+        """Compute overall reward for generated sub-questions.
+        
+        Args:
+            original_question: The original complex question
+            sub_questions: List of generated sub-questions
+            context: Image context from CLIP
+            ground_truth: Optional ground truth answer
+            weights: Weights for different criteria
+            
+        Returns:
+            Dictionary with individual scores and total reward
+        """
+        if weights is None:
+            weights = TrainingConfig().reward_weights
+        
+        logger.debug(f"Computing reward for {len(sub_questions)} sub-questions")
+        logger.debug(f"Original question: {original_question}")
+        logger.debug(f"Sub-questions: {sub_questions}")
+        
+        # Compute individual scores
+        scores = {
+            "diversity": self.score_diversity(sub_questions),
+            "relevance": self.score_relevance(original_question, sub_questions, context),
+            "answerability": self.score_answerability(sub_questions, context, ground_truth),
+            "completeness": self.score_completeness(original_question, sub_questions, ground_truth),
+            "clarity": self.score_clarity(sub_questions),
+        }
+        
+        logger.debug(f"Individual scores: {scores}")
+        
+        # Compute weighted total (normalized to 0-1 scale)
+        total_reward = sum(scores[k] * weights[k] for k in scores.keys()) / 10.0
+        scores["total"] = total_reward
+        
+        logger.info(f"Total reward: {total_reward:.3f} (diversity={scores['diversity']:.1f}, "
+                   f"relevance={scores['relevance']:.1f}, answerability={scores['answerability']:.1f}, "
+                   f"completeness={scores['completeness']:.1f}, clarity={scores['clarity']:.1f})")
+        
+        return scores
+    
+    def _generate(self, prompt: str, max_new_tokens: int = 256) -> str:
+        """Generate response from judge model."""
+        messages = [{"role": "user", "content": prompt}]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.tokenizer([text], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=0.3,  # Lower temperature for more consistent judging
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+        
+        input_length = inputs['input_ids'].shape[1]
+        generated = outputs[0][input_length:]
+        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+    
+    def _extract_score(self, response: str) -> float:
+        """Extract numeric score from judge response."""
+        import re
+        # Look for numbers 1-10
+        numbers = re.findall(r'\b([1-9]|10)\b', response)
+        if numbers:
+            return float(numbers[0])
+        # Default to middle score if parsing fails
+        return 5.0
+
+
+class SubQuestionGRPOTrainer:
+    """GRPO trainer for sub-question generation."""
+    
+    def __init__(self, config: TrainingConfig):
+        """Initialize GRPO trainer.
+        
+        Args:
+            config: Training configuration
+        """
+        self.config = config
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("=" * 60)
+        logger.info("Initializing GRPO Trainer")
+        logger.info(f"Device: {self.device}")
+        logger.info("=" * 60)
+        
+        # Load policy model (model to train)
+        logger.info(f"Loading policy model: {config.model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+        logger.debug("Policy tokenizer loaded")
+        
+        self.policy_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
+        )
+        logger.info("Policy model loaded successfully")
+        
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            logger.debug("Set pad_token to eos_token for policy model")
+        
+        # Create reference model (frozen copy for KL divergence)
+        logger.info("Creating reference model (frozen copy)...")
+        self.ref_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
+        )
+        self.ref_model.eval()
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
+        logger.info("Reference model created and frozen")
+        
+        # Initialize judge LLM
+        logger.info("Initializing judge LLM...")
+        self.judge = JudgeLLM(config.judge_model_name)
+        
+        # Setup optimizer
+        logger.info(f"Setting up AdamW optimizer with lr={config.learning_rate}")
+        self.optimizer = torch.optim.AdamW(
+            self.policy_model.parameters(),
+            lr=config.learning_rate
+        )
+        logger.debug(f"Optimizer initialized with {sum(p.numel() for p in self.policy_model.parameters() if p.requires_grad)} trainable parameters")
+        
+        # Create directories
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
+        os.makedirs(config.log_dir, exist_ok=True)
+        logger.debug(f"Created directories: {config.checkpoint_dir}, {config.log_dir}")
+        
+        # Training state
+        self.start_epoch = 0
+        self.start_step = 0
+        self.metrics = []
+        
+        # Resume from checkpoint if specified
+        if config.resume_from_checkpoint:
+            logger.info("Resuming from checkpoint...")
+            self.load_checkpoint(config.resume_from_checkpoint)
+        else:
+            logger.info("Starting fresh training (no checkpoint to resume from)")
+    
+    def generate_sub_questions(self, question: str, context: str, 
+                              num_samples: int = 1) -> List[List[str]]:
+        """Generate multiple samples of sub-questions using policy model.
+        
+        Args:
+            question: Original question
+            context: Image context from CLIP
+            num_samples: Number of samples to generate
+            
+        Returns:
+            List of sub-question lists
+        """
+        logger.debug(f"Generating {num_samples} samples for question: {question}")
+        logger.debug(f"Context: {context}")
+        
+        prompt = config.SUB_QUESTION_GENERATION_PROMPT.format(
+            context=context,
+            question=question
+        )
+        
+        # Prepare input
+        messages = [{"role": "user", "content": prompt}]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.tokenizer([text], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        all_sub_questions = []
+        
+        for sample_idx in range(num_samples):
+            logger.debug(f"Generating sample {sample_idx + 1}/{num_samples}")
+            with torch.no_grad():
+                outputs = self.policy_model.generate(
+                    **inputs,
+                    max_new_tokens=self.config.max_new_tokens,
+                    temperature=self.config.temperature,
+                    top_p=self.config.top_p,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True
+                )
+            
+            input_length = inputs['input_ids'].shape[1]
+            generated = outputs.sequences[0][input_length:]
+            response = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+            
+            logger.debug(f"Generated response {sample_idx + 1}: {response[:100]}...")
+            
+            # Parse sub-questions
+            sub_questions = self._parse_sub_questions(response)
+            logger.debug(f"Parsed {len(sub_questions)} sub-questions: {sub_questions}")
+            all_sub_questions.append(sub_questions)
+        
+        return all_sub_questions
+    
+    def _parse_sub_questions(self, response: str) -> List[str]:
+        """Parse sub-questions from model output."""
+        import re
+        
+        sub_questions = [
+            line.strip() 
+            for line in response.split('\n') 
+            if line.strip() and not line.strip().startswith('#')
+        ]
+        
+        # Remove numbering
+        sub_questions = [re.sub(r'^\d+\.?\s*', '', q) for q in sub_questions]
+        sub_questions = [re.sub(r'^[-•\*]\s*', '', q) for q in sub_questions]
+        
+        # Filter valid questions
+        sub_questions = [q for q in sub_questions if len(q) > 5]
+        
+        return sub_questions if sub_questions else ["What is in the image?"]
+    
+    def compute_grpo_loss(self, question: str, context: str, ground_truth: str = None):
+        """Compute GRPO loss for one training example.
+        
+        Args:
+            question: Original question
+            context: Image context
+            ground_truth: Optional ground truth answer
+            
+        Returns:
+            Loss tensor and metrics dict
+        """
+        logger.debug(f"Computing GRPO loss for question: {question}")
+        
+        # Generate group_size samples
+        logger.debug(f"Generating {self.config.group_size} samples...")
+        samples = self.generate_sub_questions(
+            question, context, num_samples=self.config.group_size
+        )
+        
+        # Compute rewards for each sample
+        logger.debug("Computing rewards from judge LLM...")
+        rewards = []
+        reward_details = []
+        for idx, sub_qs in enumerate(samples):
+            logger.debug(f"Evaluating sample {idx + 1}/{self.config.group_size}")
+            reward_dict = self.judge.compute_reward(
+                question, sub_qs, context, ground_truth, self.config.reward_weights
+            )
+            rewards.append(reward_dict["total"])
+            reward_details.append(reward_dict)
+        
+        rewards = torch.tensor(rewards, device=self.device)
+        logger.debug(f"Raw rewards: {rewards.tolist()}")
+        
+        # Normalize rewards (advantage estimation)
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        logger.debug(f"Advantages: {advantages.tolist()}")
+        
+        # Compute policy and reference log probabilities for each sample
+        logger.debug("Computing log probabilities for policy and reference models...")
+        policy_logprobs = []
+        ref_logprobs = []
+        
+        for idx, sub_qs in enumerate(samples):
+            # Reconstruct prompt and response
+            prompt = config.SUB_QUESTION_GENERATION_PROMPT.format(
+                context=context, question=question
+            )
+            response = "\n".join(sub_qs)
+            
+            # Get log probabilities
+            policy_lp = self._compute_logprobs(self.policy_model, prompt, response)
+            ref_lp = self._compute_logprobs(self.ref_model, prompt, response)
+            
+            logger.debug(f"Sample {idx + 1} - Policy logprob: {policy_lp.item():.4f}, Ref logprob: {ref_lp.item():.4f}")
+            
+            policy_logprobs.append(policy_lp)
+            ref_logprobs.append(ref_lp)
+        
+        policy_logprobs = torch.stack(policy_logprobs)
+        ref_logprobs = torch.stack(ref_logprobs)
+        
+        # Compute KL divergence
+        kl_div = (policy_logprobs - ref_logprobs).mean()
+        logger.debug(f"KL divergence: {kl_div.item():.4f}")
+        
+        # GRPO loss: -E[advantage * log_prob] + KL_penalty
+        policy_loss = -(advantages * policy_logprobs).mean()
+        kl_penalty = self.config.kl_coef * kl_div
+        
+        total_loss = policy_loss + kl_penalty
+        
+        logger.debug(f"Policy loss: {policy_loss.item():.4f}, KL penalty: {kl_penalty.item():.4f}, Total loss: {total_loss.item():.4f}")
+        
+        metrics = {
+            "loss": total_loss.item(),
+            "policy_loss": policy_loss.item(),
+            "kl_div": kl_div.item(),
+            "mean_reward": rewards.mean().item(),
+            "max_reward": rewards.max().item(),
+            "min_reward": rewards.min().item(),
+            "reward_details": reward_details[rewards.argmax().item()]  # Best sample's details
+        }
+        
+        logger.info(f"Loss: {total_loss.item():.4f}, Mean Reward: {rewards.mean().item():.3f}, "
+                   f"Max Reward: {rewards.max().item():.3f}, KL: {kl_div.item():.4f}")
+        
+        return total_loss, metrics
+    
+    def _compute_logprobs(self, model, prompt: str, response: str) -> torch.Tensor:
+        """Compute log probabilities of response given prompt."""
+        # Prepare full text
+        messages = [{"role": "user", "content": prompt}]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        full_text = text + response
+        
+        # Tokenize
+        inputs = self.tokenizer(full_text, return_tensors="pt")
+        prompt_inputs = self.tokenizer(text, return_tensors="pt")
+        
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        prompt_length = prompt_inputs['input_ids'].shape[1]
+        
+        # Get model outputs with appropriate context
+        if model == self.ref_model:
+            with torch.no_grad():
+                outputs = model(**inputs)
+                logits = outputs.logits
+        else:
+            outputs = model(**inputs)
+            logits = outputs.logits
+        
+        # Compute log probabilities for response tokens only
+        response_logits = logits[0, prompt_length-1:-1, :]  # Shift for next token prediction
+        response_tokens = inputs['input_ids'][0, prompt_length:]
+        
+        # Get log probabilities
+        log_probs = F.log_softmax(response_logits, dim=-1)
+        token_log_probs = log_probs.gather(1, response_tokens.unsqueeze(1)).squeeze(1)
+        
+        # Return mean log probability
+        return token_log_probs.mean()
+    
+    def train_epoch(self, dataset: List[Dict], epoch: int):
+        """Train for one epoch.
+        
+        Args:
+            dataset: List of training examples
+            epoch: Current epoch number
+        """
+        self.policy_model.train()
+        epoch_metrics = []
+        
+        # Calculate starting step for this epoch
+        start_step = self.start_step if epoch == self.start_epoch else 0
+        
+        logger.info(f"Starting epoch {epoch + 1}/{self.config.num_epochs}")
+        logger.info(f"Training on {len(dataset)} examples (starting from step {start_step})")
+        
+        pbar = tqdm(dataset[start_step:], desc=f"Epoch {epoch+1}/{self.config.num_epochs}", initial=start_step, total=len(dataset))
+        
+        for i, example in enumerate(pbar, start=start_step):
+            try:
+                logger.debug(f"Processing step {i + 1}/{len(dataset)}")
+                logger.debug(f"Example: {example.get('question', 'N/A')}")
+                
+                # Compute loss
+                loss, metrics = self.compute_grpo_loss(
+                    question=example["question"],
+                    context=example.get("context", ""),
+                    ground_truth=example.get("answer", None)
+                )
+                
+                # Backward pass
+                logger.debug("Performing backward pass...")
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), 1.0)
+                self.optimizer.step()
+                logger.debug("Optimizer step completed")
+                
+                # Log metrics
+                epoch_metrics.append(metrics)
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    "loss": f"{metrics['loss']:.4f}",
+                    "reward": f"{metrics['mean_reward']:.3f}"
+                })
+                
+                # Save checkpoint periodically
+                if (i + 1) % self.config.checkpoint_every_n_steps == 0:
+                    logger.info(f"Checkpoint interval reached at step {i + 1}")
+                    self.save_checkpoint(epoch, i + 1)
+                
+            except Exception as e:
+                logger.error(f"Error processing example {i}: {e}", exc_info=True)
+                continue
+        
+        # Log epoch metrics
+        self.log_epoch_metrics(epoch, epoch_metrics)
+        
+        # Reset start_step after first epoch completion
+        if epoch == self.start_epoch:
+            self.start_step = 0
+            logger.debug("Reset start_step to 0 after completing resumed epoch")
+        
+        return epoch_metrics
+    
+    def train(self, dataset: List[Dict]):
+        """Train the model.
+        
+        Args:
+            dataset: List of training examples with questions, contexts, and answers
+        """
+        logger.info("=" * 60)
+        logger.info("Starting GRPO training")
+        logger.info("=" * 60)
+        logger.info(f"Total epochs: {self.config.num_epochs}")
+        logger.info(f"Dataset size: {len(dataset)}")
+        logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Group size: {self.config.group_size}")
+        logger.info(f"Learning rate: {self.config.learning_rate}")
+        logger.info(f"KL coefficient: {self.config.kl_coef}")
+        logger.info(f"Checkpoints saved every {self.config.checkpoint_every_n_steps} steps")
+        
+        if self.start_epoch > 0 or self.start_step > 0:
+            logger.info(f"Resuming from: Epoch {self.start_epoch+1}, Step {self.start_step}")
+        else:
+            logger.info("Starting fresh training from epoch 1")
+        
+        logger.info("=" * 60)
+        
+        for epoch in range(self.start_epoch, self.config.num_epochs):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"EPOCH {epoch + 1}/{self.config.num_epochs}")
+            logger.info(f"{'='*60}")
+            
+            epoch_metrics = self.train_epoch(dataset, epoch)
+            
+            # Save checkpoint after each epoch
+            logger.info(f"Epoch {epoch + 1} completed, saving checkpoint...")
+            self.save_checkpoint(epoch, len(dataset))
+            
+            # Calculate and log epoch summary
+            avg_loss = np.mean([m['loss'] for m in epoch_metrics])
+            avg_reward = np.mean([m['mean_reward'] for m in epoch_metrics])
+            max_reward = np.max([m['max_reward'] for m in epoch_metrics])
+            
+            logger.info(f"\nEpoch {epoch+1} Summary:")
+            logger.info(f"  Average Loss: {avg_loss:.4f}")
+            logger.info(f"  Average Reward: {avg_reward:.3f}")
+            logger.info(f"  Max Reward: {max_reward:.3f}")
+        
+        logger.info("\n" + "=" * 60)
+        logger.info("Training completed successfully!")
+        logger.info("=" * 60)
+        self.save_final_model()
+    
+    def save_checkpoint(self, epoch: int, step: int):
+        """Save training checkpoint.
+        
+        Args:
+            epoch: Current epoch number
+            step: Current step within epoch
+        """
+        checkpoint_path = os.path.join(
+            self.config.checkpoint_dir, 
+            f"checkpoint_epoch{epoch}_step{step}.pt"
+        )
+        logger.info(f"Saving checkpoint to: {checkpoint_path}")
+        logger.debug(f"Checkpoint contains: epoch={epoch}, step={step}, dataset_hash={self.config.dataset_hash}")
+        
+        torch.save({
+            'epoch': epoch,
+            'step': step,
+            'model_state_dict': self.policy_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'dataset_hash': self.config.dataset_hash,
+        }, checkpoint_path)
+        logger.info(f"Checkpoint saved successfully")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load training checkpoint and resume training.
+        
+        Args:
+            checkpoint_path: Path to checkpoint file
+        """
+        if not os.path.exists(checkpoint_path):
+            logger.error(f"Checkpoint file not found: {checkpoint_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Verify dataset consistency
+        saved_dataset_hash = checkpoint.get('dataset_hash')
+        logger.debug(f"Checkpoint dataset hash: {saved_dataset_hash}")
+        logger.debug(f"Current dataset hash: {self.config.dataset_hash}")
+        
+        if saved_dataset_hash and saved_dataset_hash != self.config.dataset_hash:
+            warning_msg = (
+                f"WARNING: Dataset hash mismatch!\n"
+                f"  Checkpoint dataset hash: {saved_dataset_hash}\n"
+                f"  Current dataset hash: {self.config.dataset_hash}\n"
+                f"  This may indicate the dataset has changed since checkpoint was saved."
+            )
+            logger.warning(warning_msg)
+            
+            if not self.config.force_resume:
+                # Interactive prompt for safety in non-automated environments
+                try:
+                    response = input("Continue anyway? (y/n): ")
+                    if response.lower() != 'y':
+                        logger.error("Dataset mismatch - training aborted by user")
+                        raise ValueError("Dataset mismatch - training aborted by user")
+                    logger.info("User chose to continue despite dataset mismatch")
+                except (EOFError, KeyboardInterrupt):
+                    # Handle automated/non-interactive environments
+                    logger.error("Dataset mismatch and cannot prompt user - aborting")
+                    raise ValueError("Dataset mismatch and cannot prompt user - aborting. Set force_resume=True to bypass.")
+            else:
+                logger.warning("force_resume=True, continuing despite dataset mismatch...")
+        
+        # Load model and optimizer states
+        logger.info("Loading model state dict...")
+        self.policy_model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Loading optimizer state dict...")
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Restore training state
+        self.start_epoch = checkpoint['epoch']
+        self.start_step = checkpoint['step']
+        
+        logger.info(f"Successfully resumed from checkpoint: Epoch {self.start_epoch}, Step {self.start_step}")
+    
+    def save_final_model(self):
+        """Save final trained model."""
+        model_path = os.path.join(self.config.checkpoint_dir, "final_model")
+        logger.info(f"Saving final model to: {model_path}")
+        self.policy_model.save_pretrained(model_path)
+        self.tokenizer.save_pretrained(model_path)
+        logger.info("Final model saved successfully")
+    
+    def log_epoch_metrics(self, epoch: int, metrics: List[Dict]):
+        """Log metrics for the epoch."""
+        log_path = os.path.join(self.config.log_dir, f"epoch_{epoch}_metrics.json")
+        logger.info(f"Logging epoch metrics to: {log_path}")
+        with open(log_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        logger.debug(f"Logged {len(metrics)} metric entries for epoch {epoch}")
+
+
+def load_training_data(dataset_path: str, max_samples: int = None, 
+                      min_question_length: int = 5,
+                      default_context: str = "car, person, building, street, vehicle, outdoor") -> Tuple[List[Dict], str]:
+    """Load training data from VQAv2 dataset.
+    
+    Args:
+        dataset_path: Path to dataset index JSON
+        max_samples: Maximum number of samples to load
+        min_question_length: Minimum words in question to consider it complex
+        default_context: Default CLIP context when not available
+        
+    Returns:
+        Tuple of (training examples, dataset hash)
+    """
+    logger.info(f"Loading training data from: {dataset_path}")
+    
+    if not os.path.exists(dataset_path):
+        logger.warning(f"Dataset file not found at {dataset_path}")
+        logger.info("Generating dummy examples for demonstration...")
+        dummy_data = generate_dummy_data(100)
+        dataset_hash = compute_dataset_hash(dummy_data)
+        logger.info(f"Generated {len(dummy_data)} dummy examples")
+        return dummy_data, dataset_hash
+    
+    with open(dataset_path, 'r') as f:
+        data = json.load(f)
+    
+    logger.debug(f"Loaded {len(data)} total examples from file")
+    
+    # Extract complex questions (longer questions more likely to need decomposition)
+    training_examples = []
+    for item in data:
+        question = item.get("question", "")
+        # Select questions with more than min_question_length words as potentially complex
+        if len(question.split()) > min_question_length:
+            training_examples.append({
+                "question": question,
+                "answer": item.get("answer", ""),
+                "context": item.get("context", default_context),
+                "image_id": item.get("image_id", "")
+            })
+        
+        if max_samples and len(training_examples) >= max_samples:
+            logger.debug(f"Reached max_samples limit of {max_samples}")
+            break
+    
+    logger.info(f"Loaded {len(training_examples)} training examples (filtered by min_question_length={min_question_length})")
+    
+    # Compute hash for dataset consistency checking
+    dataset_hash = compute_dataset_hash(training_examples)
+    logger.info(f"Dataset hash (32 chars): {dataset_hash}")
+    
+    return training_examples, dataset_hash
+
+
+def compute_dataset_hash(dataset: List[Dict]) -> str:
+    """Compute hash of dataset for consistency checking.
+    
+    Args:
+        dataset: List of training examples
+        
+    Returns:
+        SHA256 hash of dataset (32 characters for adequate collision resistance)
+    """
+    # Create deterministic representation of dataset
+    dataset_str = json.dumps(dataset, sort_keys=True)
+    return hashlib.sha256(dataset_str.encode()).hexdigest()[:32]  # Use 32 chars (128 bits)
+
+
+def generate_dummy_data(num_samples: int = 100) -> List[Dict]:
+    """Generate dummy training data for testing.
+    
+    Args:
+        num_samples: Number of dummy examples
+        
+    Returns:
+        List of dummy training examples
+    """
+    questions = [
+        "How many people are standing near the red car?",
+        "What color is the sign behind the person on the left?",
+        "Are there more cars or people in the image?",
+        "What text is written on the building in the background?",
+        "How many objects are visible on the table?",
+        "Is the person wearing a hat and glasses?",
+        "What is the position of the dog relative to the car?",
+        "How many windows does the building have?",
+        "What is the person holding in their left hand?",
+        "Are there any animals near the tree?",
+    ]
+    
+    contexts = [
+        "car, person, street, vehicle, outdoor, red, blue",
+        "sign, text, person, building, urban",
+        "car, person, vehicle, people, crowd",
+        "building, text, sign, architecture, outdoor",
+        "table, object, item, indoor, furniture",
+    ]
+    
+    data = []
+    for i in range(num_samples):
+        data.append({
+            "question": questions[i % len(questions)],
+            "answer": "dummy answer",
+            "context": contexts[i % len(contexts)],
+            "image_id": f"dummy_{i}"
+        })
+    
+    return data
+
+
+def main():
+    """Main training function."""
+    # Initialize configuration
+    training_config = TrainingConfig()
+    
+    logger.info("=" * 60)
+    logger.info("GRPO Training for Sub-Question Generation")
+    logger.info("=" * 60)
+    logger.info(f"Policy Model: {training_config.model_name}")
+    logger.info(f"Judge Model: {training_config.judge_model_name}")
+    logger.info(f"Learning Rate: {training_config.learning_rate}")
+    logger.info(f"Batch Size: {training_config.batch_size}")
+    logger.info(f"Group Size: {training_config.group_size}")
+    logger.info(f"Epochs: {training_config.num_epochs}")
+    logger.info(f"Max Training Samples: {training_config.max_training_samples}")
+    logger.info(f"Checkpoint every {training_config.checkpoint_every_n_steps} steps")
+    logger.info(f"Reward Weights:")
+    for criterion, weight in training_config.reward_weights.items():
+        logger.info(f"  {criterion}: {weight}")
+    
+    if training_config.resume_from_checkpoint:
+        logger.info(f"Will resume from: {training_config.resume_from_checkpoint}")
+        logger.info(f"Force resume: {training_config.force_resume}")
+    
+    logger.info("=" * 60)
+    
+    # Load training data and get dataset hash
+    logger.info("Loading training dataset...")
+    dataset, dataset_hash = load_training_data(
+        training_config.dataset_path, 
+        max_samples=training_config.max_training_samples,
+        min_question_length=training_config.min_question_length,
+        default_context=training_config.default_context
+    )
+    
+    # Store dataset hash in config for checkpoint consistency
+    training_config.dataset_hash = dataset_hash
+    logger.debug(f"Stored dataset hash in config: {dataset_hash}")
+    
+    # Initialize trainer (will load checkpoint if specified)
+    logger.info("Initializing trainer...")
+    trainer = SubQuestionGRPOTrainer(training_config)
+    
+    # Train
+    logger.info("Starting training...")
+    trainer.train(dataset)
+    
+    logger.info("\n" + "=" * 60)
+    logger.info("Training completed successfully!")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
