@@ -19,12 +19,13 @@ class LLMWrapper:
         self.model_name = model_name
         
         print(f"Loading LLM model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
         )
         
         if not torch.cuda.is_available():
@@ -33,27 +34,40 @@ class LLMWrapper:
         # Set padding token if not set
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Check if model supports chat template
+        self.supports_chat = hasattr(self.tokenizer, 'apply_chat_template')
     
-    def generate(self, prompt: str, max_length: int = 512, temperature: float = 0.7) -> str:
+    def generate(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7) -> str:
         """Generate text response from prompt.
         
         Args:
             prompt: Input prompt
-            max_length: Maximum length of generated text
+            max_new_tokens: Maximum number of new tokens to generate
             temperature: Sampling temperature
             
         Returns:
             Generated text response
         """
-        # Tokenize input
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+        # For chat models like Qwen, use chat template
+        if self.supports_chat:
+            messages = [{"role": "user", "content": prompt}]
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            inputs = self.tokenizer([text], return_tensors="pt")
+        else:
+            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+        
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
         # Generate
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_length=max_length,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 do_sample=True,
                 top_p=0.9,
@@ -61,14 +75,12 @@ class LLMWrapper:
                 eos_token_id=self.tokenizer.eos_token_id
             )
         
-        # Decode
-        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Decode only the new tokens
+        input_length = inputs['input_ids'].shape[1]
+        generated_tokens = outputs[0][input_length:]
+        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
-        # Remove the prompt from the generated text
-        if generated_text.startswith(prompt):
-            generated_text = generated_text[len(prompt):].strip()
-        
-        return generated_text
+        return generated_text.strip()
     
     def check_atomicity(self, question: str, context: str) -> bool:
         """Check if a question is atomic using the LLM.
@@ -85,13 +97,16 @@ class LLMWrapper:
             question=question
         )
         
-        response = self.generate(prompt, max_length=256)
+        response = self.generate(prompt, max_new_tokens=128)
         
         # Parse response - looking for "ATOMIC" or "NOT_ATOMIC"
         response_upper = response.upper()
-        if "ATOMIC" in response_upper and "NOT_ATOMIC" not in response_upper:
+        if "NOT_ATOMIC" in response_upper or "NOT ATOMIC" in response_upper:
+            return False
+        if "ATOMIC" in response_upper:
             return True
-        return False
+        # Default to atomic for simple questions
+        return len(question.split()) <= 10
     
     def generate_tool_call(self, question: str, context: str) -> str:
         """Generate appropriate tool call for an atomic question.
@@ -108,19 +123,27 @@ class LLMWrapper:
             question=question
         )
         
-        response = self.generate(prompt, max_length=256)
+        response = self.generate(prompt, max_new_tokens=128)
         
         # Extract tool call from response
-        # Look for patterns like "grounding_dino(...)" or "ocr()"
         import re
         tool_pattern = r'(grounding_dino\([^)]*\)|ocr\(\))'
-        match = re.search(tool_pattern, response)
+        match = re.search(tool_pattern, response, re.IGNORECASE)
         
         if match:
             return match.group(1)
         
-        # If no tool call found, return the response as is
-        return response.strip()
+        # Fallback: infer tool from question
+        if any(word in question.lower() for word in ['text', 'read', 'write', 'written', 'say', 'sign']):
+            return 'ocr()'
+        else:
+            # Extract noun/object from question for grounding
+            words = question.lower().replace('?', '').split()
+            # Look for key nouns
+            for word in ['person', 'people', 'car', 'object', 'thing', 'animal', 'building']:
+                if word in words:
+                    return f'grounding_dino(query="{word}")'
+            return 'grounding_dino(query="object")'
     
     def generate_sub_questions(self, question: str, context: str) -> list:
         """Generate sub-questions for a complex question.
@@ -137,7 +160,7 @@ class LLMWrapper:
             question=question
         )
         
-        response = self.generate(prompt, max_length=512)
+        response = self.generate(prompt, max_new_tokens=256)
         
         # Parse response - split by newlines and filter empty lines
         sub_questions = [
@@ -152,6 +175,19 @@ class LLMWrapper:
             re.sub(r'^\d+\.?\s*', '', q) 
             for q in sub_questions
         ]
+        
+        # Remove any leading dashes or bullets
+        sub_questions = [
+            re.sub(r'^[-•\*]\s*', '', q)
+            for q in sub_questions
+        ]
+        
+        # Filter out empty or very short questions
+        sub_questions = [q for q in sub_questions if len(q) > 5]
+        
+        # If no sub-questions generated, create default ones
+        if len(sub_questions) == 0:
+            sub_questions = [question]  # Use original question as fallback
         
         return sub_questions
     
@@ -178,6 +214,6 @@ class LLMWrapper:
             sub_results=sub_results_text
         )
         
-        response = self.generate(prompt, max_length=512)
+        response = self.generate(prompt, max_new_tokens=256)
         
         return response.strip()

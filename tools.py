@@ -2,6 +2,8 @@
 
 from PIL import Image
 from typing import List, Dict, Any
+import torch
+import numpy as np
 import config
 
 
@@ -15,8 +17,28 @@ class GroundingDINOTool:
             config_dict: Configuration dictionary for the tool
         """
         self.config = config_dict or config.GROUNDING_DINO_CONFIG
-        # Note: Actual Grounding DINO implementation would require the model
-        # This is a placeholder that simulates the interface
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+    def _load_model(self):
+        """Lazy load Grounding DINO model."""
+        if self.model is not None:
+            return
+            
+        try:
+            from groundingdino.util.inference import load_model
+            
+            print(f"Loading Grounding DINO model...")
+            self.model = load_model(
+                self.config["config_file"],
+                self.config["checkpoint"]
+            )
+            self.model = self.model.to(self.device)
+            print("Grounding DINO model loaded successfully!")
+        except Exception as e:
+            print(f"Warning: Could not load Grounding DINO model: {e}")
+            print("Using fallback mode.")
+            self.model = "fallback"
         
     def __call__(self, image: Image.Image, query: str) -> Dict[str, Any]:
         """Perform grounding task on the image.
@@ -28,28 +50,63 @@ class GroundingDINOTool:
         Returns:
             Dictionary containing detected objects and their bounding boxes
         """
-        # Placeholder implementation
-        # Actual implementation would use Grounding DINO model
-        result = {
-            "query": query,
-            "detections": [],
-            "message": f"Grounding DINO tool called with query: {query}"
-        }
+        self._load_model()
         
-        # In real implementation, this would return:
-        # {
-        #     "query": query,
-        #     "detections": [
-        #         {"box": [x1, y1, x2, y2], "score": 0.95, "label": "person"},
-        #         ...
-        #     ]
-        # }
+        if self.model == "fallback":
+            # Fallback when model is not available
+            return {
+                "query": query,
+                "detections": [],
+                "count": 0,
+                "message": f"Fallback mode: Grounding DINO not available for query '{query}'"
+            }
         
-        return result
+        try:
+            from groundingdino.util.inference import predict
+            
+            # Run inference
+            boxes, logits, phrases = predict(
+                model=self.model,
+                image=image,
+                caption=query,
+                box_threshold=self.config["box_threshold"],
+                text_threshold=self.config["text_threshold"]
+            )
+            
+            # Convert to standard format
+            detections = []
+            h, w = image.size[1], image.size[0]
+            
+            for box, score, phrase in zip(boxes, logits, phrases):
+                # Convert normalized coordinates to pixel coordinates
+                x1, y1, x2, y2 = box.cpu().numpy()
+                x1, y1, x2, y2 = int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+                
+                detections.append({
+                    "box": [x1, y1, x2, y2],
+                    "score": float(score),
+                    "label": phrase
+                })
+            
+            return {
+                "query": query,
+                "detections": detections,
+                "count": len(detections),
+                "message": f"Detected {len(detections)} instances of '{query}'"
+            }
+            
+        except Exception as e:
+            return {
+                "query": query,
+                "detections": [],
+                "count": 0,
+                "error": str(e),
+                "message": f"Error during detection: {e}"
+            }
 
 
 class OCRTool:
-    """OCR tool for text recognition tasks."""
+    """OCR tool for text recognition tasks using EasyOCR."""
     
     def __init__(self, config_dict: Dict[str, Any] = None):
         """Initialize OCR tool.
@@ -58,8 +115,26 @@ class OCRTool:
             config_dict: Configuration dictionary for the tool
         """
         self.config = config_dict or config.OCR_CONFIG
-        # Note: Actual OCR implementation would require EasyOCR or similar
-        # This is a placeholder that simulates the interface
+        self.reader = None
+        
+    def _load_model(self):
+        """Lazy load EasyOCR reader."""
+        if self.reader is not None:
+            return
+            
+        try:
+            import easyocr
+            
+            print(f"Loading EasyOCR reader...")
+            self.reader = easyocr.Reader(
+                self.config["languages"],
+                gpu=self.config["gpu"]
+            )
+            print("EasyOCR reader loaded successfully!")
+        except Exception as e:
+            print(f"Warning: Could not load EasyOCR: {e}")
+            print("Using fallback mode.")
+            self.reader = "fallback"
         
     def __call__(self, image: Image.Image) -> Dict[str, Any]:
         """Perform OCR on the image.
@@ -70,22 +145,59 @@ class OCRTool:
         Returns:
             Dictionary containing detected text and locations
         """
-        # Placeholder implementation
-        # Actual implementation would use EasyOCR or similar
-        result = {
-            "text_detections": [],
-            "message": "OCR tool called"
-        }
+        self._load_model()
         
-        # In real implementation, this would return:
-        # {
-        #     "text_detections": [
-        #         {"text": "Hello", "box": [x1, y1, x2, y2], "confidence": 0.98},
-        #         ...
-        #     ]
-        # }
+        if self.reader == "fallback":
+            # Fallback when EasyOCR is not available
+            return {
+                "text_detections": [],
+                "full_text": "",
+                "count": 0,
+                "message": "Fallback mode: EasyOCR not available"
+            }
         
-        return result
+        try:
+            # Convert PIL image to numpy array
+            image_np = np.array(image)
+            
+            # Perform OCR
+            results = self.reader.readtext(image_np)
+            
+            # Format results
+            text_detections = []
+            all_text = []
+            
+            for bbox, text, confidence in results:
+                # bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                x_coords = [point[0] for point in bbox]
+                y_coords = [point[1] for point in bbox]
+                x1, y1 = min(x_coords), min(y_coords)
+                x2, y2 = max(x_coords), max(y_coords)
+                
+                text_detections.append({
+                    "text": text,
+                    "box": [int(x1), int(y1), int(x2), int(y2)],
+                    "confidence": float(confidence)
+                })
+                all_text.append(text)
+            
+            full_text = " ".join(all_text)
+            
+            return {
+                "text_detections": text_detections,
+                "full_text": full_text,
+                "count": len(text_detections),
+                "message": f"Detected {len(text_detections)} text regions"
+            }
+            
+        except Exception as e:
+            return {
+                "text_detections": [],
+                "full_text": "",
+                "count": 0,
+                "error": str(e),
+                "message": f"Error during OCR: {e}"
+            }
 
 
 class ToolExecutor:
@@ -113,11 +225,21 @@ class ToolExecutor:
             # Extract query parameter
             query = self._extract_parameter(tool_call_str, "query")
             result = self.grounding_dino(image, query)
-            return f"Grounding DINO detected: {result}"
+            
+            # Format result for LLM
+            if result["count"] > 0:
+                return f"Detected {result['count']} instances of '{query}': {result['detections']}"
+            else:
+                return f"No instances of '{query}' detected"
             
         elif tool_call_str.startswith("ocr()"):
             result = self.ocr(image)
-            return f"OCR detected: {result}"
+            
+            # Format result for LLM
+            if result["count"] > 0:
+                return f"OCR detected {result['count']} text regions. Full text: '{result['full_text']}'"
+            else:
+                return "No text detected in the image"
             
         else:
             return f"Unknown tool call: {tool_call_str}"
@@ -132,7 +254,6 @@ class ToolExecutor:
         Returns:
             Parameter value as string
         """
-        # Simple parameter extraction (handles query="value" or query='value')
         import re
         pattern = f'{param_name}=["\']([^"\']+)["\']'
         match = re.search(pattern, tool_call_str)

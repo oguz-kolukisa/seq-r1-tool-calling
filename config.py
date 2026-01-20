@@ -5,20 +5,29 @@ DEFAULT_DEPTH = 3
 
 # Model configurations
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
-LLM_MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"  # Can be changed to any HuggingFace model
+LLM_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"  # Qwen 3B model
 
 # CLIP configuration
 CLIP_TOP_K_TOKENS = 10
 
 # Tool configurations
 GROUNDING_DINO_CONFIG = {
-    "model_name": "IDEA-Research/grounding-dino-base",
+    "config_file": "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    "checkpoint": "groundingdino_swint_ogc.pth",
     "box_threshold": 0.35,
     "text_threshold": 0.25,
 }
 
 OCR_CONFIG = {
-    "tool": "easyocr",  # Can be changed to other OCR tools
+    "languages": ["en"],  # EasyOCR languages
+    "gpu": True,  # Use GPU if available
+}
+
+# VQAv2 Dataset configuration
+VQAV2_CONFIG = {
+    "data_dir": "data/vqav2",
+    "coco_dir": "data/coco",
+    "download_splits": ["train", "val"],  # Which splits to download
 }
 
 # Prompt templates
