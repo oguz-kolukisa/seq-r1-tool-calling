@@ -1,6 +1,6 @@
 # VQAv2 Recursive Inference System
 
-A VQA (Visual Question Answering) system that recursively decomposes complex visual questions and uses tools (Grounding DINO, OCR) to answer them.
+A VQA (Visual Question Answering) system that recursively decomposes complex visual questions and uses tools (Grounding DINO, OCR) to answer them. Includes **GRPO training** for optimizing sub-question generation.
 
 ## Quick Start
 
@@ -12,8 +12,11 @@ pip install -r requirements.txt
 python setup_grounding_dino.py
 cd GroundingDINO && pip install -e . && cd ..
 
-# Run
+# Run Inference
 python run_inference.py --image image.jpg --question "What is this?"
+
+# Train Sub-Question Generation (optional)
+python train_subquestion_grpo.py
 ```
 
 ## Core Concept
@@ -85,6 +88,7 @@ python download_vqav2.py
 - `tools.py` - Grounding DINO & OCR implementations
 - `config.py` - Configuration & prompts
 - `report_generator.py` - HTML report generation with visualizations
+- `train_subquestion_grpo.py` - **NEW**: GRPO training for sub-question generation
 
 **Utilities:**
 - `run_inference.py` - CLI interface
@@ -92,6 +96,10 @@ python download_vqav2.py
 - `setup_grounding_dino.py` - Model setup
 - `generate_report_example.py` - Generate example HTML reports
 - `test.py` - Tests
+
+**Documentation:**
+- `README.md` - This file
+- `TRAINING.md` - **NEW**: Comprehensive GRPO training guide
 
 ## HTML Report Features
 
@@ -111,11 +119,56 @@ The HTML report generation provides comprehensive visualization of the inference
 
 Run `python generate_report_example.py` to see examples.
 
+## GRPO Training for Sub-Question Generation
+
+Train the LLM to generate better sub-questions using Group Relative Policy Optimization (GRPO) with a judge LLM for multi-criteria scoring:
+
+```bash
+python train_subquestion_grpo.py
+```
+
+**Features:**
+- **5 Reward Criteria**: Diversity, Relevance, Answerability, Completeness, Clarity
+- **Judge LLM**: Larger model (Qwen 7B) scores each criterion 1-10
+- **GRPO Algorithm**: Generates multiple samples per question, uses relative rewards
+- **Configurable Weights**: Adjust importance of each criterion
+- **Checkpointing**: Saves progress and final trained model
+
+**See [TRAINING.md](TRAINING.md) for detailed documentation.**
+
+### Example Training Configuration
+
+```python
+from train_subquestion_grpo import TrainingConfig, SubQuestionGRPOTrainer
+
+config = TrainingConfig(
+    model_name="Qwen/Qwen2.5-3B-Instruct",  # Model to train
+    judge_model_name="Qwen/Qwen2.5-7B-Instruct",  # Judge model
+    learning_rate=1e-5,
+    batch_size=4,
+    num_epochs=3,
+    group_size=4,  # Samples per question
+    reward_weights={
+        "diversity": 0.20,      # Different from each other
+        "relevance": 0.25,      # Relevant to original Q
+        "answerability": 0.25,  # Can be answered with tools
+        "completeness": 0.20,   # Covers what's needed
+        "clarity": 0.10,        # Well-formed questions
+    }
+)
+
+# Load data and train
+dataset = load_training_data("data/vqav2/train_index.json", max_samples=1000)
+trainer = SubQuestionGRPOTrainer(config)
+trainer.train(dataset)
+```
+
 ## Requirements
 
 - Python 3.8+
 - PyTorch 2.0+
 - transformers, easyocr, pillow
+- accelerate, datasets, peft (for training)
 
 See `requirements.txt` for full list.
 

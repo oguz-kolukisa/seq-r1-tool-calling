@@ -9,3 +9,6 @@ supervision>=0.16.0
 gdown>=4.7.1
 pycocotools>=2.0.7
 tqdm>=4.65.0
+accelerate>=0.20.0
+datasets>=2.14.0
+peft>=0.5.0
