@@ -269,6 +269,31 @@ def verify_dataset(data_dir, coco_dir):
     print("="*80)
 
 
+def check_dataset_exists(data_dir, coco_dir):
+    """Check if dataset already exists and is complete.
+    
+    Args:
+        data_dir: VQAv2 data directory
+        coco_dir: COCO images directory
+        
+    Returns:
+        bool: True if dataset exists and appears complete
+    """
+    # Check if index files exist
+    for split in config.VQAV2_CONFIG["download_splits"]:
+        index_file = os.path.join(data_dir, f"{split}_index.json")
+        if not os.path.exists(index_file):
+            return False
+    
+    # Check if COCO directories exist and have images
+    for split_name in ["train2014", "val2014"]:
+        split_dir = os.path.join(coco_dir, split_name)
+        if not os.path.exists(split_dir) or len(os.listdir(split_dir)) == 0:
+            return False
+    
+    return True
+
+
 def main():
     """Main function to download and prepare VQAv2 dataset."""
     print("="*80)
@@ -286,6 +311,14 @@ def main():
     print(f"\nData directory: {data_dir}")
     print(f"COCO directory: {coco_dir}")
     print(f"Splits to download: {config.VQAV2_CONFIG['download_splits']}")
+    
+    # Check if dataset already exists
+    if check_dataset_exists(data_dir, coco_dir):
+        print("\n✅ Dataset already exists and appears complete!")
+        print("Skipping download. If you want to re-download, delete the data directories.")
+        # Still verify to show stats
+        verify_dataset(data_dir, coco_dir)
+        return
     
     # Download VQAv2 annotations
     download_vqav2_annotations(data_dir)
