@@ -70,3 +70,8 @@ datasets/
 # Grounding DINO
 GroundingDINO/
 groundingdino_swint_ogc.pth
+
+# HTML Reports
+report_*.html
+*_report.html
+sample_scene.png
