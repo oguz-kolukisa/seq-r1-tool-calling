@@ -11,6 +11,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from typing import List, Dict, Tuple
 import json
 import os
+import hashlib
 from dataclasses import dataclass
 from tqdm import tqdm
 import numpy as np
@@ -45,11 +46,16 @@ class TrainingConfig:
     dataset_path: str = "data/vqav2/train_index.json"
     checkpoint_dir: str = "checkpoints/subquestion_grpo"
     log_dir: str = "logs/subquestion_grpo"
+    resume_from_checkpoint: str = None  # Path to checkpoint to resume from
+    
+    # Checkpoint parameters
+    checkpoint_every_n_steps: int = 100  # Save checkpoint every N steps
     
     # Data parameters
     min_question_length: int = 5  # Minimum words for complex questions
     default_context: str = "car, person, building, street, vehicle, outdoor"  # Placeholder context
     max_training_samples: int = 200  # Maximum samples to use for training
+    dataset_hash: str = None  # Hash of dataset for consistency checking
     
     def __post_init__(self):
         if self.reward_weights is None:
@@ -342,8 +348,14 @@ class SubQuestionGRPOTrainer:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.log_dir, exist_ok=True)
         
-        # Training metrics
+        # Training state
+        self.start_epoch = 0
+        self.start_step = 0
         self.metrics = []
+        
+        # Resume from checkpoint if specified
+        if config.resume_from_checkpoint:
+            self.load_checkpoint(config.resume_from_checkpoint)
     
     def generate_sub_questions(self, question: str, context: str, 
                               num_samples: int = 1) -> List[List[str]]:
@@ -533,9 +545,12 @@ class SubQuestionGRPOTrainer:
         self.policy_model.train()
         epoch_metrics = []
         
-        pbar = tqdm(dataset, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
+        # Calculate starting step for this epoch
+        start_step = self.start_step if epoch == self.start_epoch else 0
         
-        for i, example in enumerate(pbar):
+        pbar = tqdm(dataset[start_step:], desc=f"Epoch {epoch+1}/{self.config.num_epochs}", initial=start_step, total=len(dataset))
+        
+        for i, example in enumerate(pbar, start=start_step):
             try:
                 # Compute loss
                 loss, metrics = self.compute_grpo_loss(
@@ -560,8 +575,8 @@ class SubQuestionGRPOTrainer:
                 })
                 
                 # Save checkpoint periodically
-                if (i + 1) % 100 == 0:
-                    self.save_checkpoint(epoch, i)
+                if (i + 1) % self.config.checkpoint_every_n_steps == 0:
+                    self.save_checkpoint(epoch, i + 1)
                 
             except Exception as e:
                 print(f"Error processing example {i}: {e}")
@@ -569,6 +584,10 @@ class SubQuestionGRPOTrainer:
         
         # Log epoch metrics
         self.log_epoch_metrics(epoch, epoch_metrics)
+        
+        # Reset start_step after first epoch completion
+        if epoch == self.start_epoch:
+            self.start_step = 0
         
         return epoch_metrics
     
@@ -581,8 +600,12 @@ class SubQuestionGRPOTrainer:
         print(f"Starting GRPO training for {self.config.num_epochs} epochs")
         print(f"Dataset size: {len(dataset)}")
         print(f"Batch size: {self.config.batch_size}, Group size: {self.config.group_size}")
+        print(f"Checkpoints will be saved every {self.config.checkpoint_every_n_steps} steps")
         
-        for epoch in range(self.config.num_epochs):
+        if self.start_epoch > 0 or self.start_step > 0:
+            print(f"Resuming from: Epoch {self.start_epoch+1}, Step {self.start_step}")
+        
+        for epoch in range(self.start_epoch, self.config.num_epochs):
             epoch_metrics = self.train_epoch(dataset, epoch)
             
             # Save checkpoint after each epoch
@@ -597,7 +620,12 @@ class SubQuestionGRPOTrainer:
         self.save_final_model()
     
     def save_checkpoint(self, epoch: int, step: int):
-        """Save training checkpoint."""
+        """Save training checkpoint.
+        
+        Args:
+            epoch: Current epoch number
+            step: Current step within epoch
+        """
         checkpoint_path = os.path.join(
             self.config.checkpoint_dir, 
             f"checkpoint_epoch{epoch}_step{step}.pt"
@@ -608,8 +636,41 @@ class SubQuestionGRPOTrainer:
             'model_state_dict': self.policy_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': self.config,
+            'dataset_hash': self.config.dataset_hash,
         }, checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_path}")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load training checkpoint and resume training.
+        
+        Args:
+            checkpoint_path: Path to checkpoint file
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Verify dataset consistency
+        saved_dataset_hash = checkpoint.get('dataset_hash')
+        if saved_dataset_hash and saved_dataset_hash != self.config.dataset_hash:
+            print("WARNING: Dataset hash mismatch!")
+            print(f"  Checkpoint dataset hash: {saved_dataset_hash}")
+            print(f"  Current dataset hash: {self.config.dataset_hash}")
+            response = input("Continue anyway? (y/n): ")
+            if response.lower() != 'y':
+                raise ValueError("Dataset mismatch - aborting")
+        
+        # Load model and optimizer states
+        self.policy_model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Restore training state
+        self.start_epoch = checkpoint['epoch']
+        self.start_step = checkpoint['step']
+        
+        print(f"Resumed from: Epoch {self.start_epoch}, Step {self.start_step}")
     
     def save_final_model(self):
         """Save final trained model."""
@@ -627,7 +688,7 @@ class SubQuestionGRPOTrainer:
 
 def load_training_data(dataset_path: str, max_samples: int = None, 
                       min_question_length: int = 5,
-                      default_context: str = "car, person, building, street, vehicle, outdoor") -> List[Dict]:
+                      default_context: str = "car, person, building, street, vehicle, outdoor") -> Tuple[List[Dict], str]:
     """Load training data from VQAv2 dataset.
     
     Args:
@@ -637,14 +698,16 @@ def load_training_data(dataset_path: str, max_samples: int = None,
         default_context: Default CLIP context when not available
         
     Returns:
-        List of training examples
+        Tuple of (training examples, dataset hash)
     """
     print(f"Loading training data from: {dataset_path}")
     
     if not os.path.exists(dataset_path):
         print(f"Warning: Dataset not found at {dataset_path}")
         print("Generating dummy examples for demonstration...")
-        return generate_dummy_data(100)
+        dummy_data = generate_dummy_data(100)
+        dataset_hash = compute_dataset_hash(dummy_data)
+        return dummy_data, dataset_hash
     
     with open(dataset_path, 'r') as f:
         data = json.load(f)
@@ -666,7 +729,26 @@ def load_training_data(dataset_path: str, max_samples: int = None,
             break
     
     print(f"Loaded {len(training_examples)} training examples")
-    return training_examples
+    
+    # Compute hash for dataset consistency checking
+    dataset_hash = compute_dataset_hash(training_examples)
+    print(f"Dataset hash: {dataset_hash}")
+    
+    return training_examples, dataset_hash
+
+
+def compute_dataset_hash(dataset: List[Dict]) -> str:
+    """Compute hash of dataset for consistency checking.
+    
+    Args:
+        dataset: List of training examples
+        
+    Returns:
+        SHA256 hash of dataset
+    """
+    # Create deterministic representation of dataset
+    dataset_str = json.dumps(dataset, sort_keys=True)
+    return hashlib.sha256(dataset_str.encode()).hexdigest()[:16]
 
 
 def generate_dummy_data(num_samples: int = 100) -> List[Dict]:
@@ -714,30 +796,38 @@ def generate_dummy_data(num_samples: int = 100) -> List[Dict]:
 def main():
     """Main training function."""
     # Initialize configuration
-    config = TrainingConfig()
+    training_config = TrainingConfig()
     
     print("=" * 60)
     print("GRPO Training for Sub-Question Generation")
     print("=" * 60)
-    print(f"Policy Model: {config.model_name}")
-    print(f"Judge Model: {config.judge_model_name}")
-    print(f"Learning Rate: {config.learning_rate}")
-    print(f"Batch Size: {config.batch_size}")
-    print(f"Group Size: {config.group_size}")
-    print(f"Epochs: {config.num_epochs}")
-    print(f"Reward Weights: {config.reward_weights}")
+    print(f"Policy Model: {training_config.model_name}")
+    print(f"Judge Model: {training_config.judge_model_name}")
+    print(f"Learning Rate: {training_config.learning_rate}")
+    print(f"Batch Size: {training_config.batch_size}")
+    print(f"Group Size: {training_config.group_size}")
+    print(f"Epochs: {training_config.num_epochs}")
+    print(f"Checkpoint every {training_config.checkpoint_every_n_steps} steps")
+    print(f"Reward Weights: {training_config.reward_weights}")
+    
+    if training_config.resume_from_checkpoint:
+        print(f"Will resume from: {training_config.resume_from_checkpoint}")
+    
     print("=" * 60)
     
-    # Load training data
-    dataset = load_training_data(
-        config.dataset_path, 
-        max_samples=config.max_training_samples,
-        min_question_length=config.min_question_length,
-        default_context=config.default_context
+    # Load training data and get dataset hash
+    dataset, dataset_hash = load_training_data(
+        training_config.dataset_path, 
+        max_samples=training_config.max_training_samples,
+        min_question_length=training_config.min_question_length,
+        default_context=training_config.default_context
     )
     
-    # Initialize trainer
-    trainer = SubQuestionGRPOTrainer(config)
+    # Store dataset hash in config for checkpoint consistency
+    training_config.dataset_hash = dataset_hash
+    
+    # Initialize trainer (will load checkpoint if specified)
+    trainer = SubQuestionGRPOTrainer(training_config)
     
     # Train
     trainer.train(dataset)

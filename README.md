@@ -132,7 +132,8 @@ python train_subquestion_grpo.py
 - **Judge LLM**: Larger model (Qwen 7B) scores each criterion 1-10
 - **GRPO Algorithm**: Generates multiple samples per question, uses relative rewards
 - **Configurable Weights**: Adjust importance of each criterion
-- **Checkpointing**: Saves progress and final trained model
+- **Checkpointing & Resume**: Saves progress every 100 steps (configurable), resume from any checkpoint
+- **Dataset Consistency**: Verifies dataset hasn't changed when resuming
 
 **See [TRAINING.md](TRAINING.md) for detailed documentation.**
 
@@ -148,6 +149,8 @@ config = TrainingConfig(
     batch_size=4,
     num_epochs=3,
     group_size=4,  # Samples per question
+    checkpoint_every_n_steps=100,  # Save checkpoint frequency
+    resume_from_checkpoint=None,   # Or path to checkpoint
     reward_weights={
         "diversity": 0.20,      # Different from each other
         "relevance": 0.25,      # Relevant to original Q
@@ -161,6 +164,16 @@ config = TrainingConfig(
 dataset = load_training_data("data/vqav2/train_index.json", max_samples=1000)
 trainer = SubQuestionGRPOTrainer(config)
 trainer.train(dataset)
+```
+
+### Resuming Training
+
+```python
+# Continue from a saved checkpoint
+config = TrainingConfig(
+    resume_from_checkpoint="checkpoints/subquestion_grpo/checkpoint_epoch0_step100.pt"
+)
+```
 ```
 
 ## Requirements

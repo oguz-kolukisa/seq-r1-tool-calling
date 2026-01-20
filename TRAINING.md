@@ -78,6 +78,24 @@ The judge LLM scores sub-questions on 5 criteria (1-10 scale each):
 python train_subquestion_grpo.py
 ```
 
+### Resuming from Checkpoint
+
+To resume training from a saved checkpoint:
+
+```python
+config = TrainingConfig(
+    resume_from_checkpoint="checkpoints/subquestion_grpo/checkpoint_epoch0_step100.pt"
+)
+```
+
+The system will:
+1. Verify dataset consistency (hash matching)
+2. Restore model and optimizer states
+3. Resume from the saved epoch and step
+4. Continue training seamlessly
+
+**Note**: If the dataset has changed, you'll get a warning and can choose to continue or abort.
+
 ### Custom Configuration
 
 Modify the `TrainingConfig` class in the script:
@@ -91,6 +109,8 @@ config = TrainingConfig(
     num_epochs=3,
     group_size=4,  # Samples per question for GRPO
     kl_coef=0.1,   # KL divergence coefficient
+    checkpoint_every_n_steps=100,  # Save checkpoint every N steps (default: 100)
+    resume_from_checkpoint=None,   # Path to checkpoint to resume from
     reward_weights={
         "diversity": 0.20,
         "relevance": 0.25,
@@ -183,13 +203,24 @@ Epoch 1 Summary:
 ### Checkpoints
 
 Saved to `checkpoints/subquestion_grpo/`:
-- `checkpoint_epoch{N}_step{M}.pt` - Periodic checkpoints
-- `final_model/` - Final trained model directory
+- `checkpoint_epoch{N}_step{M}.pt` - Periodic checkpoints (saved every `checkpoint_every_n_steps`)
+  - Contains: model state, optimizer state, training progress, dataset hash
+  - Used for resuming training
+  - Default: saved every 100 steps + end of each epoch
+- `final_model/` - Final trained model directory (HuggingFace format)
+
+**Checkpoint Management:**
+- Checkpoints include dataset hash for consistency verification
+- Resume training will verify dataset hasn't changed
+- Old checkpoints can be manually deleted to save disk space
 
 ### Logs
 
 Saved to `logs/subquestion_grpo/`:
 - `epoch_{N}_metrics.json` - Detailed metrics for each epoch
+  - Loss, rewards, KL divergence
+  - Best/worst samples per batch
+  - Reward breakdown by criterion
 
 ### Using Trained Model
 
