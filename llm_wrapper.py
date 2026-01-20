@@ -108,42 +108,49 @@ class LLMWrapper:
         # Default to atomic for simple questions
         return len(question.split()) <= 10
     
-    def generate_tool_call(self, question: str, context: str) -> str:
-        """Generate appropriate tool call for an atomic question.
+    def generate_tool_call(self, question: str, context: str) -> list:
+        """Generate appropriate tool calls for an atomic question.
         
         Args:
             question: The atomic question
             context: Visual context from CLIP
             
         Returns:
-            Tool call string
+            List of tool call strings (can be one or multiple)
         """
         prompt = config.TOOL_CALL_GENERATION_PROMPT.format(
             context=context,
             question=question
         )
         
-        response = self.generate(prompt, max_new_tokens=128)
+        response = self.generate(prompt, max_new_tokens=256)
         
-        # Extract tool call from response
+        # Extract all tool calls from response
         import re
         tool_pattern = r'(grounding_dino\([^)]*\)|ocr\(\))'
-        match = re.search(tool_pattern, response, re.IGNORECASE)
+        matches = re.findall(tool_pattern, response, re.IGNORECASE)
         
-        if match:
-            return match.group(1)
+        if matches:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_calls = []
+            for call in matches:
+                if call.lower() not in seen:
+                    seen.add(call.lower())
+                    unique_calls.append(call)
+            return unique_calls
         
         # Fallback: infer tool from question
         if any(word in question.lower() for word in ['text', 'read', 'write', 'written', 'say', 'sign']):
-            return 'ocr()'
+            return ['ocr()']
         else:
             # Extract noun/object from question for grounding
             words = question.lower().replace('?', '').split()
             # Look for key nouns
             for word in ['person', 'people', 'car', 'object', 'thing', 'animal', 'building']:
                 if word in words:
-                    return f'grounding_dino(query="{word}")'
-            return 'grounding_dino(query="object")'
+                    return [f'grounding_dino(query="{word}")']
+            return ['grounding_dino(query="object")']
     
     def generate_sub_questions(self, question: str, context: str) -> list:
         """Generate sub-questions for a complex question.

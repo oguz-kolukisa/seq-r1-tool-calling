@@ -84,22 +84,25 @@ class VQAInference:
         print(f"{'  ' * depth}Is atomic: {is_atomic}")
         
         if is_atomic:
-            # Step 3a: Generate tool call
-            print(f"{'  ' * depth}Generating tool call...")
-            tool_call = self.llm.generate_tool_call(question, context)
-            print(f"{'  ' * depth}Tool call: {tool_call}")
+            # Step 3a: Generate tool calls (can be multiple)
+            print(f"{'  ' * depth}Generating tool calls...")
+            tool_calls = self.llm.generate_tool_call(question, context)
+            print(f"{'  ' * depth}Tool calls: {tool_calls}")
             
-            # Execute tool call
-            print(f"{'  ' * depth}Executing tool...")
-            tool_result = self.tool_executor.execute_tool_call(image, tool_call)
-            print(f"{'  ' * depth}Tool result: {tool_result}")
+            # Execute all tool calls
+            tool_results = []
+            for tool_call in tool_calls:
+                print(f"{'  ' * depth}Executing tool: {tool_call}")
+                tool_result = self.tool_executor.execute_tool_call(image, tool_call)
+                print(f"{'  ' * depth}Tool result: {tool_result}")
+                tool_results.append((tool_call, tool_result))
             
-            # Reason about tool result to generate final answer
-            print(f"{'  ' * depth}Reasoning from tool result...")
+            # Reason about all tool results to generate final answer
+            print(f"{'  ' * depth}Reasoning from {len(tool_results)} tool result(s)...")
             final_answer = self.llm.aggregate_results(
                 question, 
                 context, 
-                [(tool_call, tool_result)]
+                tool_results
             )
             print(f"{'  ' * depth}Final answer: {final_answer}")
             

@@ -39,7 +39,7 @@ Question: {question}
 Respond with either "ATOMIC" or "NOT_ATOMIC" followed by a brief explanation.
 """
 
-TOOL_CALL_GENERATION_PROMPT = """Given the following atomic question and image context, generate the appropriate tool call to answer it.
+TOOL_CALL_GENERATION_PROMPT = """Given the following atomic question and image context, generate the appropriate tool call(s) to answer it.
 
 Image Context: {context}
 Question: {question}
@@ -48,7 +48,8 @@ Available tools:
 - grounding_dino: For object detection and grounding tasks. Usage: grounding_dino(query="object to detect")
 - ocr: For text recognition tasks. Usage: ocr()
 
-Generate the tool call in the format: tool_name(parameters)
+You can generate one or multiple tool calls if needed. Generate the tool calls in the format: tool_name(parameters)
+For multiple tools, list them on separate lines or separated by commas.
 """
 
 SUB_QUESTION_GENERATION_PROMPT = """Given the following complex question and image context, break it down into smaller atomic sub-questions that can be answered independently.
