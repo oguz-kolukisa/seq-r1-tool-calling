@@ -1,109 +1,72 @@
-"""Example script showing how to use VQA inference system."""
+"""Usage examples for VQAv2 inference system."""
 
 from inference import VQAInference
-from PIL import Image
-import json
 
 
-def example_single_inference():
-    """Example of single question-image inference."""
-    print("="*80)
-    print("Example 1: Single Inference")
-    print("="*80)
+def example_basic():
+    """Basic single inference example."""
+    print("Example: Basic Inference")
+    print("-" * 40)
     
-    # Initialize VQA engine with default models
-    vqa_engine = VQAInference(max_depth=3)
-    
-    # Example inference (you need to provide actual image path)
-    image_path = "path/to/your/image.jpg"
-    question = "How many people are in the image?"
-    
-    # Run inference
-    result = vqa_engine.inference_vqav2(image_path, question)
-    
-    print("\nResult:")
-    print(json.dumps(result, indent=2))
-
-
-def example_batch_inference():
-    """Example of batch inference on multiple questions."""
-    print("\n" + "="*80)
-    print("Example 2: Batch Inference")
-    print("="*80)
-    
-    # Initialize VQA engine
-    vqa_engine = VQAInference(max_depth=3)
-    
-    # Prepare batch data (list of (image_path, question) tuples)
-    data = [
-        ("path/to/image1.jpg", "What color is the car?"),
-        ("path/to/image2.jpg", "How many people are sitting at the table?"),
-        ("path/to/image3.jpg", "What text is visible in the image?"),
-    ]
-    
-    # Run batch inference
-    results = vqa_engine.batch_inference(data)
-    
-    print("\nBatch Results:")
-    print(json.dumps(results, indent=2))
-
-
-def example_custom_models():
-    """Example using custom model configurations."""
-    print("\n" + "="*80)
-    print("Example 3: Custom Models")
-    print("="*80)
-    
-    # Initialize with custom models
-    vqa_engine = VQAInference(
-        llm_model_name="microsoft/phi-2",  # Smaller LLM for faster inference
-        clip_model_name="openai/clip-vit-base-patch32",
-        max_depth=2  # Limit recursion depth
+    vqa = VQAInference(max_depth=3)
+    result = vqa.inference_vqav2(
+        image_path="path/to/image.jpg",
+        question="What is in this image?"
     )
-    
-    image_path = "path/to/image.jpg"
-    question = "What is happening in this scene?"
-    
-    result = vqa_engine.inference_vqav2(image_path, question)
-    
-    print("\nResult with custom models:")
-    print(json.dumps(result, indent=2))
+    print(f"Answer: {result['answer']}")
 
 
-def example_direct_answer_function():
-    """Example of directly using the recursive answer function."""
-    print("\n" + "="*80)
-    print("Example 4: Direct Answer Function Usage")
-    print("="*80)
+def example_batch():
+    """Batch inference example."""
+    print("\nExample: Batch Processing")
+    print("-" * 40)
     
-    # Initialize VQA engine
-    vqa_engine = VQAInference(max_depth=3)
+    vqa = VQAInference(max_depth=3)
+    data = [
+        ("image1.jpg", "How many people?"),
+        ("image2.jpg", "What color is the car?"),
+    ]
+    results = vqa.batch_inference(data)
     
-    # Load image
-    image_path = "path/to/image.jpg"
-    image = Image.open(image_path).convert('RGB')
+    for r in results:
+        print(f"Q: {r['question']}")
+        print(f"A: {r['answer']}\n")
+
+
+def example_vqa2_dataset():
+    """VQAv2 dataset example."""
+    print("\nExample: VQAv2 Dataset")
+    print("-" * 40)
     
-    # Complex question that should trigger sub-question generation
-    question = "How many red objects are there and what is their location?"
+    import json
     
-    # Call answer function directly
-    answer = vqa_engine.answer(image, question, depth=0)
+    # Load dataset
+    with open('data/vqav2/val_index.json') as f:
+        data = json.load(f)
     
-    print(f"\nQuestion: {question}")
-    print(f"Answer: {answer}")
+    vqa = VQAInference(max_depth=3)
+    
+    # Process first 3 samples
+    for entry in data[:3]:
+        result = vqa.inference_vqav2(
+            entry['image_path'],
+            entry['question']
+        )
+        print(f"Q: {entry['question']}")
+        print(f"A: {result['answer']}")
+        if 'answers' in entry:
+            print(f"GT: {entry['answers'][:3]}")
+        print()
 
 
 if __name__ == "__main__":
     print("VQAv2 Inference Examples")
-    print("="*80)
-    print("\nThese examples demonstrate the VQA inference system.")
-    print("Note: You need to provide actual image paths to run these examples.")
-    print("="*80)
+    print("=" * 40)
+    print("\nNote: Update image paths to run examples")
+    print("=" * 40)
     
-    # Uncomment the example you want to run:
-    # example_single_inference()
-    # example_batch_inference()
-    # example_custom_models()
-    # example_direct_answer_function()
-    
-    print("\nTo run examples, uncomment the desired function call in the script.")
+    # Uncomment to run:
+    # example_basic()
+    # example_batch()
+    # example_vqa2_dataset()
+
