@@ -50,6 +50,7 @@ class TrainingConfig:
     
     # Checkpoint parameters
     checkpoint_every_n_steps: int = 100  # Save checkpoint every N steps
+    force_resume: bool = False  # If True, skip dataset mismatch prompt
     
     # Data parameters
     min_question_length: int = 5  # Minimum words for complex questions
@@ -655,12 +656,25 @@ class SubQuestionGRPOTrainer:
         # Verify dataset consistency
         saved_dataset_hash = checkpoint.get('dataset_hash')
         if saved_dataset_hash and saved_dataset_hash != self.config.dataset_hash:
-            print("WARNING: Dataset hash mismatch!")
-            print(f"  Checkpoint dataset hash: {saved_dataset_hash}")
-            print(f"  Current dataset hash: {self.config.dataset_hash}")
-            response = input("Continue anyway? (y/n): ")
-            if response.lower() != 'y':
-                raise ValueError("Dataset mismatch - aborting")
+            warning_msg = (
+                f"WARNING: Dataset hash mismatch!\n"
+                f"  Checkpoint dataset hash: {saved_dataset_hash}\n"
+                f"  Current dataset hash: {self.config.dataset_hash}\n"
+                f"  This may indicate the dataset has changed since checkpoint was saved."
+            )
+            print(warning_msg)
+            
+            if not self.config.force_resume:
+                # Interactive prompt for safety in non-automated environments
+                try:
+                    response = input("Continue anyway? (y/n): ")
+                    if response.lower() != 'y':
+                        raise ValueError("Dataset mismatch - training aborted by user")
+                except (EOFError, KeyboardInterrupt):
+                    # Handle automated/non-interactive environments
+                    raise ValueError("Dataset mismatch and cannot prompt user - aborting. Set force_resume=True to bypass.")
+            else:
+                print("force_resume=True, continuing despite dataset mismatch...")
         
         # Load model and optimizer states
         self.policy_model.load_state_dict(checkpoint['model_state_dict'])
@@ -744,11 +758,11 @@ def compute_dataset_hash(dataset: List[Dict]) -> str:
         dataset: List of training examples
         
     Returns:
-        SHA256 hash of dataset
+        SHA256 hash of dataset (32 characters for adequate collision resistance)
     """
     # Create deterministic representation of dataset
     dataset_str = json.dumps(dataset, sort_keys=True)
-    return hashlib.sha256(dataset_str.encode()).hexdigest()[:16]
+    return hashlib.sha256(dataset_str.encode()).hexdigest()[:32]  # Use 32 chars (128 bits)
 
 
 def generate_dummy_data(num_samples: int = 100) -> List[Dict]:
