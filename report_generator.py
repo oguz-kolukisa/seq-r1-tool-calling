@@ -2,6 +2,7 @@
 
 import os
 import base64
+import html
 from io import BytesIO
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -48,7 +49,7 @@ class InferenceReport:
                 img_str = base64.b64encode(buffered.getvalue()).decode()
                 return f"data:image/png;base64,{img_str}"
         except Exception as e:
-            return f"Error loading image: {e}"
+            return f"Error loading image: {html.escape(str(e))}"
     
     def _format_step_html(self, step: Dict[str, Any], index: int) -> str:
         """Format a single step as HTML."""
@@ -56,74 +57,74 @@ class InferenceReport:
         indent = "  " * depth
         step_type = step.get('type', 'unknown')
         
-        html = f'<div class="step depth-{depth}" id="step-{index}">\n'
-        html += f'  <div class="step-header">\n'
-        html += f'    <span class="step-number">Step {index + 1}</span>\n'
-        html += f'    <span class="step-depth">Depth: {depth}</span>\n'
-        html += f'    <span class="step-type">{step_type.replace("_", " ").title()}</span>\n'
-        html += f'  </div>\n'
-        html += f'  <div class="step-content">\n'
+        html_out = f'<div class="step depth-{depth}" id="step-{index}">\n'
+        html_out += f'  <div class="step-header">\n'
+        html_out += f'    <span class="step-number">Step {index + 1}</span>\n'
+        html_out += f'    <span class="step-depth">Depth: {depth}</span>\n'
+        html_out += f'    <span class="step-type">{html.escape(step_type.replace("_", " ").title())}</span>\n'
+        html_out += f'  </div>\n'
+        html_out += f'  <div class="step-content">\n'
         
         # Question
         if 'question' in step:
-            html += f'    <div class="field"><strong>Question:</strong> {step["question"]}</div>\n'
+            html_out += f'    <div class="field"><strong>Question:</strong> {html.escape(step["question"])}</div>\n'
         
         # CLIP Context
         if 'context' in step:
-            html += f'    <div class="field"><strong>Visual Context (CLIP):</strong> <code>{step["context"]}</code></div>\n'
+            html_out += f'    <div class="field"><strong>Visual Context (CLIP):</strong> <code>{html.escape(step["context"])}</code></div>\n'
         
         # Atomicity
         if 'is_atomic' in step:
             atomic_class = 'atomic' if step['is_atomic'] else 'not-atomic'
             atomic_text = 'ATOMIC' if step['is_atomic'] else 'NOT ATOMIC'
-            html += f'    <div class="field"><strong>Atomicity:</strong> <span class="badge {atomic_class}">{atomic_text}</span></div>\n'
+            html_out += f'    <div class="field"><strong>Atomicity:</strong> <span class="badge {atomic_class}">{atomic_text}</span></div>\n'
         
         # Tool Calls
         if 'tool_calls' in step:
-            html += f'    <div class="field"><strong>Tool Calls:</strong></div>\n'
-            html += f'    <ul class="tool-calls">\n'
+            html_out += f'    <div class="field"><strong>Tool Calls:</strong></div>\n'
+            html_out += f'    <ul class="tool-calls">\n'
             for tool_call in step['tool_calls']:
-                html += f'      <li><code>{tool_call}</code></li>\n'
-            html += f'    </ul>\n'
+                html_out += f'      <li><code>{html.escape(str(tool_call))}</code></li>\n'
+            html_out += f'    </ul>\n'
         
         # Tool Results
         if 'tool_results' in step:
-            html += f'    <div class="field"><strong>Tool Results:</strong></div>\n'
-            html += f'    <div class="tool-results">\n'
+            html_out += f'    <div class="field"><strong>Tool Results:</strong></div>\n'
+            html_out += f'    <div class="tool-results">\n'
             for tool_call, result in step['tool_results']:
-                html += f'      <div class="tool-result">\n'
-                html += f'        <div class="tool-call"><code>{tool_call}</code></div>\n'
-                html += f'        <div class="result-text">{result}</div>\n'
-                html += f'      </div>\n'
-            html += f'    </div>\n'
+                html_out += f'      <div class="tool-result">\n'
+                html_out += f'        <div class="tool-call"><code>{html.escape(str(tool_call))}</code></div>\n'
+                html_out += f'        <div class="result-text">{html.escape(str(result))}</div>\n'
+                html_out += f'      </div>\n'
+            html_out += f'    </div>\n'
         
         # Sub-questions
         if 'sub_questions' in step:
-            html += f'    <div class="field"><strong>Sub-questions:</strong></div>\n'
-            html += f'    <ol class="sub-questions">\n'
+            html_out += f'    <div class="field"><strong>Sub-questions:</strong></div>\n'
+            html_out += f'    <ol class="sub-questions">\n'
             for sub_q in step['sub_questions']:
-                html += f'      <li>{sub_q}</li>\n'
-            html += f'    </ol>\n'
+                html_out += f'      <li>{html.escape(str(sub_q))}</li>\n'
+            html_out += f'    </ol>\n'
         
         # Sub-results
         if 'sub_results' in step:
-            html += f'    <div class="field"><strong>Sub-question Results:</strong></div>\n'
-            html += f'    <div class="sub-results">\n'
+            html_out += f'    <div class="field"><strong>Sub-question Results:</strong></div>\n'
+            html_out += f'    <div class="sub-results">\n'
             for sub_q, sub_a in step['sub_results']:
-                html += f'      <div class="sub-result">\n'
-                html += f'        <div class="sub-question"><strong>Q:</strong> {sub_q}</div>\n'
-                html += f'        <div class="sub-answer"><strong>A:</strong> {sub_a}</div>\n'
-                html += f'      </div>\n'
-            html += f'    </div>\n'
+                html_out += f'      <div class="sub-result">\n'
+                html_out += f'        <div class="sub-question"><strong>Q:</strong> {html.escape(str(sub_q))}</div>\n'
+                html_out += f'        <div class="sub-answer"><strong>A:</strong> {html.escape(str(sub_a))}</div>\n'
+                html_out += f'      </div>\n'
+            html_out += f'    </div>\n'
         
         # Answer
         if 'answer' in step:
-            html += f'    <div class="field answer-field"><strong>Answer:</strong> {step["answer"]}</div>\n'
+            html_out += f'    <div class="field answer-field"><strong>Answer:</strong> {html.escape(str(step["answer"]))}</div>\n'
         
-        html += f'  </div>\n'
-        html += f'</div>\n'
+        html_out += f'  </div>\n'
+        html_out += f'</div>\n'
         
-        return html
+        return html_out
     
     def generate_html(self, output_path: str):
         """Generate HTML report and save to file."""
@@ -460,14 +461,14 @@ class InferenceReport:
                 <img src="{image_data}" alt="Input Image">
             </div>
             <div class="question-text">
-                <strong>Question:</strong> {self.question}
+                <strong>Question:</strong> {html.escape(str(self.question)) if self.question else ''}
             </div>
         </div>
         
         <div class="final-answer-section">
             <h2>✅ Final Answer</h2>
             <div class="final-answer-text">
-                {self.final_answer}
+                {html.escape(str(self.final_answer)) if self.final_answer else ''}
             </div>
         </div>
         
@@ -478,11 +479,11 @@ class InferenceReport:
             </div>
             <div class="info-item">
                 <div class="info-label">Execution Time</div>
-                <div class="info-value">{duration}</div>
+                <div class="info-value">{html.escape(duration)}</div>
             </div>
             <div class="info-item">
                 <div class="info-label">Max Depth</div>
-                <div class="info-value">{max([s.get('depth', 0) for s in self.steps]) if self.steps else 0}</div>
+                <div class="info-value">{max((s.get('depth', 0) for s in self.steps), default=0)}</div>
             </div>
         </div>
         
