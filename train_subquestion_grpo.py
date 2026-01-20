@@ -16,6 +16,19 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import numpy as np
 import config
+import logging
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -79,9 +92,12 @@ class JudgeLLM:
             model_name: HuggingFace model name for judge
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading Judge LLM: {model_name}")
+        logger.info(f"Initializing Judge LLM: {model_name}")
+        logger.debug(f"Device for Judge LLM: {self.device}")
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        logger.debug("Judge tokenizer loaded successfully")
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -89,9 +105,11 @@ class JudgeLLM:
             low_cpu_mem_usage=True,
             trust_remote_code=True
         )
+        logger.info("Judge model loaded successfully")
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            logger.debug("Set pad_token to eos_token")
     
     def score_diversity(self, sub_questions: List[str]) -> float:
         """Score how diverse/different the sub-questions are from each other.
@@ -102,6 +120,8 @@ class JudgeLLM:
         Returns:
             Diversity score from 1-10
         """
+        logger.debug(f"Scoring diversity for {len(sub_questions)} sub-questions")
+        
         prompt = f"""Rate the diversity of these sub-questions on a scale of 1-10, where:
 - 1-3: Very similar or repetitive questions
 - 4-6: Some variation but overlapping concepts
@@ -114,7 +134,9 @@ Sub-questions:
 Provide only a single number from 1 to 10 as your rating."""
 
         response = self._generate(prompt, max_new_tokens=10)
-        return self._extract_score(response)
+        score = self._extract_score(response)
+        logger.debug(f"Diversity score: {score} (response: {response[:50]}...)")
+        return score
     
     def score_relevance(self, original_question: str, sub_questions: List[str], 
                        context: str) -> float:
@@ -249,6 +271,10 @@ Provide only a single number from 1 to 10 as your rating."""
         if weights is None:
             weights = TrainingConfig().reward_weights
         
+        logger.debug(f"Computing reward for {len(sub_questions)} sub-questions")
+        logger.debug(f"Original question: {original_question}")
+        logger.debug(f"Sub-questions: {sub_questions}")
+        
         # Compute individual scores
         scores = {
             "diversity": self.score_diversity(sub_questions),
@@ -258,9 +284,15 @@ Provide only a single number from 1 to 10 as your rating."""
             "clarity": self.score_clarity(sub_questions),
         }
         
+        logger.debug(f"Individual scores: {scores}")
+        
         # Compute weighted total (normalized to 0-1 scale)
         total_reward = sum(scores[k] * weights[k] for k in scores.keys()) / 10.0
         scores["total"] = total_reward
+        
+        logger.info(f"Total reward: {total_reward:.3f} (diversity={scores['diversity']:.1f}, "
+                   f"relevance={scores['relevance']:.1f}, answerability={scores['answerability']:.1f}, "
+                   f"completeness={scores['completeness']:.1f}, clarity={scores['clarity']:.1f})")
         
         return scores
     
@@ -308,10 +340,16 @@ class SubQuestionGRPOTrainer:
         """
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("=" * 60)
+        logger.info("Initializing GRPO Trainer")
+        logger.info(f"Device: {self.device}")
+        logger.info("=" * 60)
         
         # Load policy model (model to train)
-        print(f"Loading policy model: {config.model_name}")
+        logger.info(f"Loading policy model: {config.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+        logger.debug("Policy tokenizer loaded")
+        
         self.policy_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -319,12 +357,14 @@ class SubQuestionGRPOTrainer:
             low_cpu_mem_usage=True,
             trust_remote_code=True
         )
+        logger.info("Policy model loaded successfully")
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            logger.debug("Set pad_token to eos_token for policy model")
         
         # Create reference model (frozen copy for KL divergence)
-        print("Creating reference model...")
+        logger.info("Creating reference model (frozen copy)...")
         self.ref_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -335,19 +375,24 @@ class SubQuestionGRPOTrainer:
         self.ref_model.eval()
         for param in self.ref_model.parameters():
             param.requires_grad = False
+        logger.info("Reference model created and frozen")
         
         # Initialize judge LLM
+        logger.info("Initializing judge LLM...")
         self.judge = JudgeLLM(config.judge_model_name)
         
         # Setup optimizer
+        logger.info(f"Setting up AdamW optimizer with lr={config.learning_rate}")
         self.optimizer = torch.optim.AdamW(
             self.policy_model.parameters(),
             lr=config.learning_rate
         )
+        logger.debug(f"Optimizer initialized with {sum(p.numel() for p in self.policy_model.parameters() if p.requires_grad)} trainable parameters")
         
         # Create directories
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.log_dir, exist_ok=True)
+        logger.debug(f"Created directories: {config.checkpoint_dir}, {config.log_dir}")
         
         # Training state
         self.start_epoch = 0
@@ -356,7 +401,10 @@ class SubQuestionGRPOTrainer:
         
         # Resume from checkpoint if specified
         if config.resume_from_checkpoint:
+            logger.info("Resuming from checkpoint...")
             self.load_checkpoint(config.resume_from_checkpoint)
+        else:
+            logger.info("Starting fresh training (no checkpoint to resume from)")
     
     def generate_sub_questions(self, question: str, context: str, 
                               num_samples: int = 1) -> List[List[str]]:
@@ -370,6 +418,9 @@ class SubQuestionGRPOTrainer:
         Returns:
             List of sub-question lists
         """
+        logger.debug(f"Generating {num_samples} samples for question: {question}")
+        logger.debug(f"Context: {context}")
+        
         prompt = config.SUB_QUESTION_GENERATION_PROMPT.format(
             context=context,
             question=question
@@ -385,7 +436,8 @@ class SubQuestionGRPOTrainer:
         
         all_sub_questions = []
         
-        for _ in range(num_samples):
+        for sample_idx in range(num_samples):
+            logger.debug(f"Generating sample {sample_idx + 1}/{num_samples}")
             with torch.no_grad():
                 outputs = self.policy_model.generate(
                     **inputs,
@@ -402,8 +454,11 @@ class SubQuestionGRPOTrainer:
             generated = outputs.sequences[0][input_length:]
             response = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
             
+            logger.debug(f"Generated response {sample_idx + 1}: {response[:100]}...")
+            
             # Parse sub-questions
             sub_questions = self._parse_sub_questions(response)
+            logger.debug(f"Parsed {len(sub_questions)} sub-questions: {sub_questions}")
             all_sub_questions.append(sub_questions)
         
         return all_sub_questions
@@ -438,15 +493,20 @@ class SubQuestionGRPOTrainer:
         Returns:
             Loss tensor and metrics dict
         """
+        logger.debug(f"Computing GRPO loss for question: {question}")
+        
         # Generate group_size samples
+        logger.debug(f"Generating {self.config.group_size} samples...")
         samples = self.generate_sub_questions(
             question, context, num_samples=self.config.group_size
         )
         
         # Compute rewards for each sample
+        logger.debug("Computing rewards from judge LLM...")
         rewards = []
         reward_details = []
-        for sub_qs in samples:
+        for idx, sub_qs in enumerate(samples):
+            logger.debug(f"Evaluating sample {idx + 1}/{self.config.group_size}")
             reward_dict = self.judge.compute_reward(
                 question, sub_qs, context, ground_truth, self.config.reward_weights
             )
@@ -454,15 +514,18 @@ class SubQuestionGRPOTrainer:
             reward_details.append(reward_dict)
         
         rewards = torch.tensor(rewards, device=self.device)
+        logger.debug(f"Raw rewards: {rewards.tolist()}")
         
         # Normalize rewards (advantage estimation)
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        logger.debug(f"Advantages: {advantages.tolist()}")
         
         # Compute policy and reference log probabilities for each sample
+        logger.debug("Computing log probabilities for policy and reference models...")
         policy_logprobs = []
         ref_logprobs = []
         
-        for sub_qs in samples:
+        for idx, sub_qs in enumerate(samples):
             # Reconstruct prompt and response
             prompt = config.SUB_QUESTION_GENERATION_PROMPT.format(
                 context=context, question=question
@@ -473,6 +536,8 @@ class SubQuestionGRPOTrainer:
             policy_lp = self._compute_logprobs(self.policy_model, prompt, response)
             ref_lp = self._compute_logprobs(self.ref_model, prompt, response)
             
+            logger.debug(f"Sample {idx + 1} - Policy logprob: {policy_lp.item():.4f}, Ref logprob: {ref_lp.item():.4f}")
+            
             policy_logprobs.append(policy_lp)
             ref_logprobs.append(ref_lp)
         
@@ -481,12 +546,15 @@ class SubQuestionGRPOTrainer:
         
         # Compute KL divergence
         kl_div = (policy_logprobs - ref_logprobs).mean()
+        logger.debug(f"KL divergence: {kl_div.item():.4f}")
         
         # GRPO loss: -E[advantage * log_prob] + KL_penalty
         policy_loss = -(advantages * policy_logprobs).mean()
         kl_penalty = self.config.kl_coef * kl_div
         
         total_loss = policy_loss + kl_penalty
+        
+        logger.debug(f"Policy loss: {policy_loss.item():.4f}, KL penalty: {kl_penalty.item():.4f}, Total loss: {total_loss.item():.4f}")
         
         metrics = {
             "loss": total_loss.item(),
@@ -497,6 +565,9 @@ class SubQuestionGRPOTrainer:
             "min_reward": rewards.min().item(),
             "reward_details": reward_details[rewards.argmax().item()]  # Best sample's details
         }
+        
+        logger.info(f"Loss: {total_loss.item():.4f}, Mean Reward: {rewards.mean().item():.3f}, "
+                   f"Max Reward: {rewards.max().item():.3f}, KL: {kl_div.item():.4f}")
         
         return total_loss, metrics
     
@@ -549,10 +620,16 @@ class SubQuestionGRPOTrainer:
         # Calculate starting step for this epoch
         start_step = self.start_step if epoch == self.start_epoch else 0
         
+        logger.info(f"Starting epoch {epoch + 1}/{self.config.num_epochs}")
+        logger.info(f"Training on {len(dataset)} examples (starting from step {start_step})")
+        
         pbar = tqdm(dataset[start_step:], desc=f"Epoch {epoch+1}/{self.config.num_epochs}", initial=start_step, total=len(dataset))
         
         for i, example in enumerate(pbar, start=start_step):
             try:
+                logger.debug(f"Processing step {i + 1}/{len(dataset)}")
+                logger.debug(f"Example: {example.get('question', 'N/A')}")
+                
                 # Compute loss
                 loss, metrics = self.compute_grpo_loss(
                     question=example["question"],
@@ -561,10 +638,12 @@ class SubQuestionGRPOTrainer:
                 )
                 
                 # Backward pass
+                logger.debug("Performing backward pass...")
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), 1.0)
                 self.optimizer.step()
+                logger.debug("Optimizer step completed")
                 
                 # Log metrics
                 epoch_metrics.append(metrics)
@@ -577,10 +656,11 @@ class SubQuestionGRPOTrainer:
                 
                 # Save checkpoint periodically
                 if (i + 1) % self.config.checkpoint_every_n_steps == 0:
+                    logger.info(f"Checkpoint interval reached at step {i + 1}")
                     self.save_checkpoint(epoch, i + 1)
                 
             except Exception as e:
-                print(f"Error processing example {i}: {e}")
+                logger.error(f"Error processing example {i}: {e}", exc_info=True)
                 continue
         
         # Log epoch metrics
@@ -589,6 +669,7 @@ class SubQuestionGRPOTrainer:
         # Reset start_step after first epoch completion
         if epoch == self.start_epoch:
             self.start_step = 0
+            logger.debug("Reset start_step to 0 after completing resumed epoch")
         
         return epoch_metrics
     
@@ -598,26 +679,48 @@ class SubQuestionGRPOTrainer:
         Args:
             dataset: List of training examples with questions, contexts, and answers
         """
-        print(f"Starting GRPO training for {self.config.num_epochs} epochs")
-        print(f"Dataset size: {len(dataset)}")
-        print(f"Batch size: {self.config.batch_size}, Group size: {self.config.group_size}")
-        print(f"Checkpoints will be saved every {self.config.checkpoint_every_n_steps} steps")
+        logger.info("=" * 60)
+        logger.info("Starting GRPO training")
+        logger.info("=" * 60)
+        logger.info(f"Total epochs: {self.config.num_epochs}")
+        logger.info(f"Dataset size: {len(dataset)}")
+        logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Group size: {self.config.group_size}")
+        logger.info(f"Learning rate: {self.config.learning_rate}")
+        logger.info(f"KL coefficient: {self.config.kl_coef}")
+        logger.info(f"Checkpoints saved every {self.config.checkpoint_every_n_steps} steps")
         
         if self.start_epoch > 0 or self.start_step > 0:
-            print(f"Resuming from: Epoch {self.start_epoch+1}, Step {self.start_step}")
+            logger.info(f"Resuming from: Epoch {self.start_epoch+1}, Step {self.start_step}")
+        else:
+            logger.info("Starting fresh training from epoch 1")
+        
+        logger.info("=" * 60)
         
         for epoch in range(self.start_epoch, self.config.num_epochs):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"EPOCH {epoch + 1}/{self.config.num_epochs}")
+            logger.info(f"{'='*60}")
+            
             epoch_metrics = self.train_epoch(dataset, epoch)
             
             # Save checkpoint after each epoch
+            logger.info(f"Epoch {epoch + 1} completed, saving checkpoint...")
             self.save_checkpoint(epoch, len(dataset))
             
-            print(f"\nEpoch {epoch+1} Summary:")
-            print(f"  Avg Loss: {np.mean([m['loss'] for m in epoch_metrics]):.4f}")
-            print(f"  Avg Reward: {np.mean([m['mean_reward'] for m in epoch_metrics]):.3f}")
-            print(f"  Max Reward: {np.max([m['max_reward'] for m in epoch_metrics]):.3f}")
+            # Calculate and log epoch summary
+            avg_loss = np.mean([m['loss'] for m in epoch_metrics])
+            avg_reward = np.mean([m['mean_reward'] for m in epoch_metrics])
+            max_reward = np.max([m['max_reward'] for m in epoch_metrics])
+            
+            logger.info(f"\nEpoch {epoch+1} Summary:")
+            logger.info(f"  Average Loss: {avg_loss:.4f}")
+            logger.info(f"  Average Reward: {avg_reward:.3f}")
+            logger.info(f"  Max Reward: {max_reward:.3f}")
         
-        print("\nTraining completed!")
+        logger.info("\n" + "=" * 60)
+        logger.info("Training completed successfully!")
+        logger.info("=" * 60)
         self.save_final_model()
     
     def save_checkpoint(self, epoch: int, step: int):
@@ -631,6 +734,9 @@ class SubQuestionGRPOTrainer:
             self.config.checkpoint_dir, 
             f"checkpoint_epoch{epoch}_step{step}.pt"
         )
+        logger.info(f"Saving checkpoint to: {checkpoint_path}")
+        logger.debug(f"Checkpoint contains: epoch={epoch}, step={step}, dataset_hash={self.config.dataset_hash}")
+        
         torch.save({
             'epoch': epoch,
             'step': step,
@@ -639,7 +745,7 @@ class SubQuestionGRPOTrainer:
             'config': self.config,
             'dataset_hash': self.config.dataset_hash,
         }, checkpoint_path)
-        print(f"Saved checkpoint: {checkpoint_path}")
+        logger.info(f"Checkpoint saved successfully")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load training checkpoint and resume training.
@@ -648,13 +754,17 @@ class SubQuestionGRPOTrainer:
             checkpoint_path: Path to checkpoint file
         """
         if not os.path.exists(checkpoint_path):
+            logger.error(f"Checkpoint file not found: {checkpoint_path}")
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
-        print(f"Loading checkpoint from: {checkpoint_path}")
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         # Verify dataset consistency
         saved_dataset_hash = checkpoint.get('dataset_hash')
+        logger.debug(f"Checkpoint dataset hash: {saved_dataset_hash}")
+        logger.debug(f"Current dataset hash: {self.config.dataset_hash}")
+        
         if saved_dataset_hash and saved_dataset_hash != self.config.dataset_hash:
             warning_msg = (
                 f"WARNING: Dataset hash mismatch!\n"
@@ -662,42 +772,50 @@ class SubQuestionGRPOTrainer:
                 f"  Current dataset hash: {self.config.dataset_hash}\n"
                 f"  This may indicate the dataset has changed since checkpoint was saved."
             )
-            print(warning_msg)
+            logger.warning(warning_msg)
             
             if not self.config.force_resume:
                 # Interactive prompt for safety in non-automated environments
                 try:
                     response = input("Continue anyway? (y/n): ")
                     if response.lower() != 'y':
+                        logger.error("Dataset mismatch - training aborted by user")
                         raise ValueError("Dataset mismatch - training aborted by user")
+                    logger.info("User chose to continue despite dataset mismatch")
                 except (EOFError, KeyboardInterrupt):
                     # Handle automated/non-interactive environments
+                    logger.error("Dataset mismatch and cannot prompt user - aborting")
                     raise ValueError("Dataset mismatch and cannot prompt user - aborting. Set force_resume=True to bypass.")
             else:
-                print("force_resume=True, continuing despite dataset mismatch...")
+                logger.warning("force_resume=True, continuing despite dataset mismatch...")
         
         # Load model and optimizer states
+        logger.info("Loading model state dict...")
         self.policy_model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Loading optimizer state dict...")
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         # Restore training state
         self.start_epoch = checkpoint['epoch']
         self.start_step = checkpoint['step']
         
-        print(f"Resumed from: Epoch {self.start_epoch}, Step {self.start_step}")
+        logger.info(f"Successfully resumed from checkpoint: Epoch {self.start_epoch}, Step {self.start_step}")
     
     def save_final_model(self):
         """Save final trained model."""
         model_path = os.path.join(self.config.checkpoint_dir, "final_model")
+        logger.info(f"Saving final model to: {model_path}")
         self.policy_model.save_pretrained(model_path)
         self.tokenizer.save_pretrained(model_path)
-        print(f"Saved final model to: {model_path}")
+        logger.info("Final model saved successfully")
     
     def log_epoch_metrics(self, epoch: int, metrics: List[Dict]):
         """Log metrics for the epoch."""
         log_path = os.path.join(self.config.log_dir, f"epoch_{epoch}_metrics.json")
+        logger.info(f"Logging epoch metrics to: {log_path}")
         with open(log_path, 'w') as f:
             json.dump(metrics, f, indent=2)
+        logger.debug(f"Logged {len(metrics)} metric entries for epoch {epoch}")
 
 
 def load_training_data(dataset_path: str, max_samples: int = None, 
@@ -714,17 +832,20 @@ def load_training_data(dataset_path: str, max_samples: int = None,
     Returns:
         Tuple of (training examples, dataset hash)
     """
-    print(f"Loading training data from: {dataset_path}")
+    logger.info(f"Loading training data from: {dataset_path}")
     
     if not os.path.exists(dataset_path):
-        print(f"Warning: Dataset not found at {dataset_path}")
-        print("Generating dummy examples for demonstration...")
+        logger.warning(f"Dataset file not found at {dataset_path}")
+        logger.info("Generating dummy examples for demonstration...")
         dummy_data = generate_dummy_data(100)
         dataset_hash = compute_dataset_hash(dummy_data)
+        logger.info(f"Generated {len(dummy_data)} dummy examples")
         return dummy_data, dataset_hash
     
     with open(dataset_path, 'r') as f:
         data = json.load(f)
+    
+    logger.debug(f"Loaded {len(data)} total examples from file")
     
     # Extract complex questions (longer questions more likely to need decomposition)
     training_examples = []
@@ -740,13 +861,14 @@ def load_training_data(dataset_path: str, max_samples: int = None,
             })
         
         if max_samples and len(training_examples) >= max_samples:
+            logger.debug(f"Reached max_samples limit of {max_samples}")
             break
     
-    print(f"Loaded {len(training_examples)} training examples")
+    logger.info(f"Loaded {len(training_examples)} training examples (filtered by min_question_length={min_question_length})")
     
     # Compute hash for dataset consistency checking
     dataset_hash = compute_dataset_hash(training_examples)
-    print(f"Dataset hash: {dataset_hash}")
+    logger.info(f"Dataset hash (32 chars): {dataset_hash}")
     
     return training_examples, dataset_hash
 
@@ -812,24 +934,29 @@ def main():
     # Initialize configuration
     training_config = TrainingConfig()
     
-    print("=" * 60)
-    print("GRPO Training for Sub-Question Generation")
-    print("=" * 60)
-    print(f"Policy Model: {training_config.model_name}")
-    print(f"Judge Model: {training_config.judge_model_name}")
-    print(f"Learning Rate: {training_config.learning_rate}")
-    print(f"Batch Size: {training_config.batch_size}")
-    print(f"Group Size: {training_config.group_size}")
-    print(f"Epochs: {training_config.num_epochs}")
-    print(f"Checkpoint every {training_config.checkpoint_every_n_steps} steps")
-    print(f"Reward Weights: {training_config.reward_weights}")
+    logger.info("=" * 60)
+    logger.info("GRPO Training for Sub-Question Generation")
+    logger.info("=" * 60)
+    logger.info(f"Policy Model: {training_config.model_name}")
+    logger.info(f"Judge Model: {training_config.judge_model_name}")
+    logger.info(f"Learning Rate: {training_config.learning_rate}")
+    logger.info(f"Batch Size: {training_config.batch_size}")
+    logger.info(f"Group Size: {training_config.group_size}")
+    logger.info(f"Epochs: {training_config.num_epochs}")
+    logger.info(f"Max Training Samples: {training_config.max_training_samples}")
+    logger.info(f"Checkpoint every {training_config.checkpoint_every_n_steps} steps")
+    logger.info(f"Reward Weights:")
+    for criterion, weight in training_config.reward_weights.items():
+        logger.info(f"  {criterion}: {weight}")
     
     if training_config.resume_from_checkpoint:
-        print(f"Will resume from: {training_config.resume_from_checkpoint}")
+        logger.info(f"Will resume from: {training_config.resume_from_checkpoint}")
+        logger.info(f"Force resume: {training_config.force_resume}")
     
-    print("=" * 60)
+    logger.info("=" * 60)
     
     # Load training data and get dataset hash
+    logger.info("Loading training dataset...")
     dataset, dataset_hash = load_training_data(
         training_config.dataset_path, 
         max_samples=training_config.max_training_samples,
@@ -839,14 +966,19 @@ def main():
     
     # Store dataset hash in config for checkpoint consistency
     training_config.dataset_hash = dataset_hash
+    logger.debug(f"Stored dataset hash in config: {dataset_hash}")
     
     # Initialize trainer (will load checkpoint if specified)
+    logger.info("Initializing trainer...")
     trainer = SubQuestionGRPOTrainer(training_config)
     
     # Train
+    logger.info("Starting training...")
     trainer.train(dataset)
     
-    print("\nTraining completed successfully!")
+    logger.info("\n" + "=" * 60)
+    logger.info("Training completed successfully!")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
