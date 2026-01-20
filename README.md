@@ -20,8 +20,8 @@ python run_inference.py --image image.jpg --question "What is this?"
 
 ```
 question → CLIP context → atomicity check
-    ├─ ATOMIC: generate tool call → execute → answer
-    └─ NOT ATOMIC: generate sub-questions → recurse → aggregate
+    ├─ ATOMIC: tool call → execute → LLM reasons → answer
+    └─ NOT ATOMIC: sub-questions → recurse → LLM aggregates → answer
 ```
 
 ## Usage

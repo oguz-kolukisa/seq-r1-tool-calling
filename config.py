@@ -59,13 +59,13 @@ Question: {question}
 Generate a list of sub-questions, one per line, that together will help answer the original question.
 """
 
-AGGREGATE_RESULTS_PROMPT = """Given the following question, sub-questions, and their answers, synthesize a final answer to the original question.
+AGGREGATE_RESULTS_PROMPT = """Given the following question, tool results or sub-question answers, reason about them and provide a final answer to the original question.
 
 Original Question: {question}
 Image Context: {context}
 
-Sub-questions and Answers:
+Tool Results / Sub-questions and Answers:
 {sub_results}
 
-Provide a comprehensive final answer to the original question.
+Based on the information above, provide a clear and direct answer to the original question.
 """

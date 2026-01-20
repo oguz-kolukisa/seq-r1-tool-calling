@@ -91,10 +91,19 @@ class VQAInference:
             
             # Execute tool call
             print(f"{'  ' * depth}Executing tool...")
-            result = self.tool_executor.execute_tool_call(image, tool_call)
-            print(f"{'  ' * depth}Tool result: {result}")
+            tool_result = self.tool_executor.execute_tool_call(image, tool_call)
+            print(f"{'  ' * depth}Tool result: {tool_result}")
             
-            return result
+            # Reason about tool result to generate final answer
+            print(f"{'  ' * depth}Reasoning from tool result...")
+            final_answer = self.llm.aggregate_results(
+                question, 
+                context, 
+                [(tool_call, tool_result)]
+            )
+            print(f"{'  ' * depth}Final answer: {final_answer}")
+            
+            return final_answer
         
         else:
             # Step 3b: Generate sub-questions

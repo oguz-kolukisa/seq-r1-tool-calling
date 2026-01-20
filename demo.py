@@ -14,7 +14,8 @@ def show_flow():
     print("Flow:")
     print("  [Depth 0] → CLIP context → ATOMIC")
     print("          → grounding_dino(query='car')")
-    print("          → 'Red car detected'")
+    print("          → Tool result: 'Red car detected'")
+    print("          → LLM reasoning: Generate answer from tool result")
     print()
     print("A: The car is red")
     
@@ -45,9 +46,10 @@ def show_flow():
     print("Key Concepts:")
     print("  • CLIP extracts visual context (top-10 concepts)")
     print("  • LLM determines if question is atomic")
-    print("  • Atomic → tool call, Not atomic → decompose")
+    print("  • Atomic → tool call → LLM reasons about result")
+    print("  • Not atomic → decompose → recurse → aggregate")
     print("  • Recursive processing with depth limit (default: 3)")
-    print("  • Results aggregated by LLM")
+    print("  • All results processed through LLM for reasoning")
     print("="*60)
 
 
