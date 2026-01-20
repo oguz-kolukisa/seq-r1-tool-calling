@@ -22,7 +22,7 @@ class TrainingConfig:
     """Configuration for GRPO training."""
     
     # Model paths
-    model_name: str = config.LLM_MODEL_NAME  # Model to train
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct"  # Model to train
     judge_model_name: str = "Qwen/Qwen2.5-7B-Instruct"  # Larger model for judging
     
     # Training hyperparameters
@@ -45,6 +45,11 @@ class TrainingConfig:
     dataset_path: str = "data/vqav2/train_index.json"
     checkpoint_dir: str = "checkpoints/subquestion_grpo"
     log_dir: str = "logs/subquestion_grpo"
+    
+    # Data parameters
+    min_question_length: int = 5  # Minimum words for complex questions
+    default_context: str = "car, person, building, street, vehicle, outdoor"  # Placeholder context
+    max_training_samples: int = 200  # Maximum samples to use for training
     
     def __post_init__(self):
         if self.reward_weights is None:
@@ -498,8 +503,12 @@ class SubQuestionGRPOTrainer:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         prompt_length = prompt_inputs['input_ids'].shape[1]
         
-        # Get model outputs
-        with torch.no_grad() if model == self.ref_model else torch.enable_grad():
+        # Get model outputs with appropriate context
+        if model == self.ref_model:
+            with torch.no_grad():
+                outputs = model(**inputs)
+                logits = outputs.logits
+        else:
             outputs = model(**inputs)
             logits = outputs.logits
         
@@ -616,12 +625,16 @@ class SubQuestionGRPOTrainer:
             json.dump(metrics, f, indent=2)
 
 
-def load_training_data(dataset_path: str, max_samples: int = None) -> List[Dict]:
+def load_training_data(dataset_path: str, max_samples: int = None, 
+                      min_question_length: int = 5,
+                      default_context: str = "car, person, building, street, vehicle, outdoor") -> List[Dict]:
     """Load training data from VQAv2 dataset.
     
     Args:
         dataset_path: Path to dataset index JSON
         max_samples: Maximum number of samples to load
+        min_question_length: Minimum words in question to consider it complex
+        default_context: Default CLIP context when not available
         
     Returns:
         List of training examples
@@ -640,12 +653,12 @@ def load_training_data(dataset_path: str, max_samples: int = None) -> List[Dict]
     training_examples = []
     for item in data:
         question = item.get("question", "")
-        # Select questions with more than 5 words as potentially complex
-        if len(question.split()) > 5:
+        # Select questions with more than min_question_length words as potentially complex
+        if len(question.split()) > min_question_length:
             training_examples.append({
                 "question": question,
                 "answer": item.get("answer", ""),
-                "context": "car, person, building, street, vehicle, outdoor",  # Placeholder
+                "context": item.get("context", default_context),
                 "image_id": item.get("image_id", "")
             })
         
@@ -716,7 +729,12 @@ def main():
     print("=" * 60)
     
     # Load training data
-    dataset = load_training_data(config.dataset_path, max_samples=200)
+    dataset = load_training_data(
+        config.dataset_path, 
+        max_samples=config.max_training_samples,
+        min_question_length=config.min_question_length,
+        default_context=config.default_context
+    )
     
     # Initialize trainer
     trainer = SubQuestionGRPOTrainer(config)
